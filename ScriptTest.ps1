@@ -44,7 +44,7 @@ function Write-HsStartupLog([string]$Message) {
     } catch {}
 }
 
-$script:PowerShellExe = Join-Path $PSHOME 'powershell.exe'
+$script:PowerShellExe = Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
 if ([Environment]::Is64BitOperatingSystem -and -not [Environment]::Is64BitProcess) {
     $nativeShell = Join-Path $env:WINDIR 'Sysnative\WindowsPowerShell\v1.0\powershell.exe'
     if (Test-Path -LiteralPath $nativeShell -PathType Leaf) {
@@ -56,7 +56,8 @@ if ([Environment]::Is64BitOperatingSystem -and -not [Environment]::Is64BitProces
 # An encoded one-line launcher preserves Unicode, spaces and quotes in file paths.
 $needsAdmin = (-not $script:IsElevated) -and (-not $FpsProbe)
 $needsSta = ([Threading.Thread]::CurrentThread.ApartmentState -ne 'STA') -and (-not $FpsProbe)
-if ($needsAdmin -or $needsSta) {
+$needsDesktopHost = $PSVersionTable.PSEdition -eq 'Core' -and -not $FpsProbe
+if ($needsAdmin -or $needsSta -or $needsDesktopHost) {
     $scriptFile = [string]$PSCommandPath
     if ([string]::IsNullOrWhiteSpace($scriptFile)) {
         $scriptFile = [string]$MyInvocation.MyCommand.Path
@@ -142,8 +143,12 @@ Add-Type -AssemblyName PresentationFramework,PresentationCore,WindowsBase
 # MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
 $script:Fps433Ready = $false
 try {
-    if (-not ('ScriptXFps483.Engine' -as [type])) {
-        Add-Type -TypeDefinition @'
+    if (-not ('ScriptXFps484.Engine' -as [type])) {
+        $fpsCompileOptions = @{}
+        if ($PSVersionTable.PSEdition -eq 'Desktop') {
+            $fpsCompileOptions.ReferencedAssemblies = @('System.dll','System.Core.dll')
+        }
+        Add-Type @fpsCompileOptions -TypeDefinition @'
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -156,7 +161,7 @@ using System.Threading;
 using System.Runtime.InteropServices;
 using Microsoft.Win32.SafeHandles;
 
-namespace ScriptXFps483 {
+namespace ScriptXFps484 {
     public sealed class Snapshot {
         public string State="STARTING", Detail="", Game="", Source="", Identity="", Chain="", ExitedIdentity="";
         public string CaptureStatus="STARTING", RtssStatus="STARTING", Session="", Evidence="UNKNOWN";
@@ -194,8 +199,8 @@ namespace ScriptXFps483 {
     internal sealed class App {
         internal int Pid;
         internal string Name;
-        internal long StartTicks, Seen, IdentityChecked;
-        internal bool Alive, Verified;
+        internal long StartTicks, Seen, IdentityChecked, WindowChecked;
+        internal bool Alive, Verified, HasWindow;
         internal SafeWaitHandle Lifetime;
         internal string IdentityStatus="PENDING";
         internal int[] Ancestors=new int[0];
@@ -305,7 +310,7 @@ namespace ScriptXFps483 {
             foreach(int ancestor in a.Ancestors) if(ancestor==foreground) return true;
             return false;
         }
-        internal Snapshot Build(long now,int foreground) {
+        internal Snapshot Build(long now,int foreground,bool dashboardFocused=false) {
             App selected=null,pinned=null;
             Apps.TryGetValue(TargetPid,out pinned);
             if(pinned!=null && (!pinned.Alive || !pinned.Verified || pinned.Identity!=TargetIdentity)) pinned=null;
@@ -325,9 +330,17 @@ namespace ScriptXFps483 {
                         return new Snapshot {State="MULTIPLE_RENDERERS",Detail="Multiple focused child renderers. Use -FpsTargetPid."};
                     }
                 }
-                // Only retain a previously attributed identity on Alt+Tab. A visible singleton
-                // elsewhere on the desktop is not evidence of which game the user is playing.
                 if(selected==null) selected=pinned;
+                // On a cold start the dashboard itself takes focus. Surface the only
+                // verified windowed presenter by name, without guessing among multiple apps.
+                if(selected==null && dashboardFocused) {
+                    foreach(App a in Apps.Values) {
+                        if(!a.HasWindow || !HasFrames(a,now)) continue;
+                        if(selected!=null) return new Snapshot { State="MULTIPLE_RENDERERS",
+                            Detail="Focus the game or specify its renderer PID." };
+                        selected=a;
+                    }
+                }
             }
             if(selected==null) {
                 TargetPid=0;TargetIdentity="";
@@ -429,6 +442,9 @@ namespace ScriptXFps483 {
         [DllImport("kernel32.dll",SetLastError=true)] private static extern uint WaitForSingleObject(SafeWaitHandle handle,uint milliseconds);
         [DllImport("kernel32.dll",SetLastError=true)] [return: MarshalAs(UnmanagedType.Bool)]
         private static extern bool GetProcessTimes(SafeWaitHandle handle,out long created,out long exited,out long kernel,out long user);
+        [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool QueryFullProcessImageName(SafeWaitHandle handle,uint flags,StringBuilder path,ref int length);
         private sealed class BoundedWebClient : WebClient {
             protected override WebRequest GetWebRequest(Uri address) {
                 WebRequest r=base.GetWebRequest(address);r.Timeout=15000;
@@ -816,10 +832,13 @@ namespace ScriptXFps483 {
         private static void RefreshIdentities(long now) {
             List<App> due=new List<App>();
             lock(DataGate) {
+                List<App> expired=new List<App>();
                 foreach(App a in core.Apps.Values) {
+                    if(a.Pid!=core.TargetPid && MonitorCore.Age(now,a.Seen)>30000) { expired.Add(a);continue; }
                     if(a.IdentityChecked>0 && MonitorCore.Age(now,a.IdentityChecked)<1000) continue;
                     a.IdentityChecked=now;due.Add(a);
                 }
+                foreach(App a in expired) ForgetApp(a,"INACTIVE_CANDIDATE");
             }
             // OS metadata calls never hold the CSV ingestion lock. After initial verification,
             // a read-only lifetime handle checks exit without reopening/querying the process every second.
@@ -832,7 +851,15 @@ namespace ScriptXFps483 {
                         lock(DataGate) {
                             if(!CurrentApp(a)) continue;
                             if(wait==0) { ForgetApp(a,"PROCESS_EXITED");continue; }
-                            a.IdentityStatus=wait==258?"VERIFIED_HANDLE":"LIFETIME_CHECK_UNCONFIRMED";
+                            a.Verified=wait==258;
+                            a.IdentityStatus=a.Verified?"VERIFIED_HANDLE":"LIFETIME_CHECK_UNCONFIRMED";
+                        }
+                        if(!a.HasWindow && a.Verified && MonitorCore.Age(now,a.WindowChecked)>=2000) {
+                            a.WindowChecked=now;
+                            using(Process p=Process.GetProcessById(a.Pid)) {
+                                bool visible=p.MainWindowHandle!=IntPtr.Zero;
+                                lock(DataGate) if(CurrentApp(a)) a.HasWindow=visible;
+                            }
                         }
                     } else {
                         IntPtr raw=OpenProcess(0x00101000,false,a.Pid); // SYNCHRONIZE | QUERY_LIMITED_INFORMATION only
@@ -850,16 +877,24 @@ namespace ScriptXFps483 {
                         long created,exitTime,kernel,user;
                         if(!GetProcessTimes(opened,out created,out exitTime,out kernel,out user)) continue;
                         long start=DateTime.FromFileTimeUtc(created).Ticks;
-                        string actual;int[] parents;
+                        int length=32768;
+                        StringBuilder path=new StringBuilder(length);
+                        if(!QueryFullProcessImageName(opened,0,path,ref length)) continue;
+                        string actual=BaseName(path.ToString());
+                        bool hasWindow=false;
+                        int[] parents;
                         using(Process p=Process.GetProcessById(a.Pid)) {
-                            actual=p.ProcessName+".exe";parents=Ancestors(p,opened);
+                            try { hasWindow=p.MainWindowHandle!=IntPtr.Zero; } catch(System.ComponentModel.Win32Exception) { }
+                            parents=Ancestors(p,opened);
                         }
                         if(WaitForSingleObject(opened,0)==0) {
                             lock(DataGate) ForgetApp(a,"PROCESS_EXITED");continue;
                         }
                         lock(DataGate) {
                             if(!CurrentApp(a)) continue;
-                            if(IsExcluded(a.Pid,actual) || !actual.Equals(a.Name,StringComparison.OrdinalIgnoreCase) ||
+                            bool sameName=actual.Equals(a.Name,StringComparison.OrdinalIgnoreCase) ||
+                                actual.Equals(a.Name+".exe",StringComparison.OrdinalIgnoreCase);
+                            if(IsExcluded(a.Pid,actual) || !sameName ||
                                 (a.StartTicks!=0 && a.StartTicks!=start)) { ForgetApp(a,"IDENTITY_MISMATCH");continue; }
                             long checkedAt=Stopwatch.GetTimestamp();
                             long born=checkedAt-MonitorCore.Ticks((DateTime.UtcNow-new DateTime(start,DateTimeKind.Utc)).TotalMilliseconds);
@@ -869,7 +904,7 @@ namespace ScriptXFps483 {
                                 if(c.Last<born) preBirth.Add(c.Key);
                             }
                             foreach(string key in preBirth) a.Streams.Remove(key);
-                            a.StartTicks=start;a.Alive=true;a.Verified=true;a.Ancestors=parents;
+                            a.StartTicks=start;a.Alive=true;a.Verified=true;a.WindowChecked=now;a.HasWindow=hasWindow;a.Ancestors=parents;
                             a.IdentityStatus="VERIFIED_HANDLE";a.Lifetime=opened;opened=null;
                         }
                     }
@@ -896,7 +931,7 @@ namespace ScriptXFps483 {
                 // Take the clock AFTER acquiring the ingestion lock. New CSV frames may have
                 // arrived while RTSS/metadata work ran; never judge them against an earlier tick.
                 long now=Stopwatch.GetTimestamp();
-                Snapshot s=core.Build(now,foreground);
+                Snapshot s=core.Build(now,foreground,foreground==OwnPid);
                 s.CaptureStatus=captureStatus;s.RtssStatus=rtssStatus;
                 s.StdoutRows=lines;s.ParsedRows=usable;s.RejectedRows=rejected;s.ExcludedRows=excluded;
                 s.Detail+=";schema="+schemaStatus+";reader="+readerStatus+";loss="+lossEvidence+
@@ -984,7 +1019,7 @@ namespace ScriptXFps483 {
 
 '@ -IgnoreWarnings -ErrorAction Stop
     }
-    $script:Fps433Ready = ('ScriptXFps483.Engine' -as [type]) -ne $null
+    $script:Fps433Ready = ('ScriptXFps484.Engine' -as [type]) -ne $null
 } catch {
     Write-HsStartupLog ('FPS_COMPILE_FAILED: ' + ($_ | Out-String))
 }
@@ -992,12 +1027,12 @@ $script:Fps433EngineRoot = Join-Path $env:LOCALAPPDATA 'ScriptX\Engines'
 $script:Fps433Log = Join-Path $env:LOCALAPPDATA 'ScriptX\fps-diagnostics.log'
 function Start-Fps433Engine {
     if ($script:Fps433Ready) {
-        [ScriptXFps483.Engine]::Start($script:Fps433EngineRoot, $PSScriptRoot,
+        [ScriptXFps484.Engine]::Start($script:Fps433EngineRoot, $PSScriptRoot,
             $script:Fps433Log, [bool]($FpsDiagnostics -or $FpsProbe), [int]$FpsTargetPid)
     }
 }
 function Stop-Fps433Engine {
-    if ($script:Fps433Ready) { [ScriptXFps483.Engine]::Stop() }
+    if ($script:Fps433Ready) { [ScriptXFps484.Engine]::Stop() }
 }
 
 # FPS-only compositor. The arc animates while the number reports the latest sample.
@@ -1444,8 +1479,11 @@ function Get-FpsCaptureCaption($Frame) {
         { $_ -in 'ETW_START_FAILED','ENGINE_START_ERROR','ENGINE_EXIT','READER_STOP_FAILED','CAPTURE_WORKER_ERROR' } { return 'Capture unavailable' }
     }
     if ($Frame.Evidence -eq 'CAPTURE_UNAVAILABLE' -and $Frame.CaptureStatus -eq 'RUNNING') { return 'Capture unavailable' }
+    if ($Frame.CaptureStatus -eq 'RUNNING' -and $Frame.State -eq 'WAITING_FOR_GAME' -and $Frame.StdoutRows -le 1) {
+        return 'Waiting for game frames'
+    }
     switch ($Frame.State) {
-        'MULTIPLE_RENDERERS' { return 'Multiple renderers · select PID' }
+        'MULTIPLE_RENDERERS' { return 'Focus a game window' }
         'IDENTITY_UNAVAILABLE' { return 'Process identity unavailable' }
         'TARGET_NOT_OBSERVED' { return 'Waiting for target PID' }
         'WAITING_FOR_GAME' { return 'Focus the game' }
@@ -1460,7 +1498,7 @@ function Update-RealGameFps {
         $ui.FpsStatusText.Text = 'Capture engine unavailable'
         return
     }
-    $frame = [ScriptXFps483.Engine]::GetLatest()
+    $frame = [ScriptXFps484.Engine]::GetLatest()
     $script:FpsUiSnapshot = $frame
     $now = [datetime]::UtcNow
     $isMeasured = ($frame.State -eq 'LIVE') -and ($frame.Fps -gt 0) -and ($frame.Pid -gt 0) -and (-not [string]::IsNullOrWhiteSpace([string]$frame.Identity))
@@ -1583,7 +1621,7 @@ function Write-FpsUiDiagnostic {
         $arcTarget = if ($null -ne $script:FpsFramePresenter) {
             [double](43.93 * (1.0 - (Get-FpsRingFraction $script:FpsFramePresenter.LatestTarget)))
         } else { [double](43.93 * (1.0 - $script:FpsGaugeLevel)) }
-        [ScriptXFps483.Engine]::RecordUi([string]$frame.Identity, [string]$frame.Source,
+        [ScriptXFps484.Engine]::RecordUi([string]$frame.Identity, [string]$frame.Source,
             [long]$frame.Sequence, [string]$frame.State, [double]$script:FpsGaugeLatestReal,
             [string]$ui.FpsLive.Text, [double]$arcTarget,
             [double]$ui.FpsRingProgress.StrokeDashOffset, [double]$ui.FpsRingProgress.Opacity)
@@ -1600,10 +1638,10 @@ if ($FpsProbe) {
     try {
         for ($sample = 0; $sample -lt $FpsProbeSeconds; $sample++) {
             Start-Sleep -Seconds 1
-            $frame = [ScriptXFps483.Engine]::GetLatest()
+            $frame = [ScriptXFps484.Engine]::GetLatest()
             Write-Output ('{0:HH:mm:ss} STATE={1} SOURCE={2} FPS={3:0.0} GAME={4} PID={5} AGE_MS={6:0} EVIDENCE={7} {8}' -f
                 (Get-Date), $frame.State, $frame.Source, $frame.Fps, $frame.Game, $frame.Pid,
-                $frame.FrameAgeMs, $frame.Evidence, [ScriptXFps483.Engine]::Diagnostic())
+                $frame.FrameAgeMs, $frame.Evidence, [ScriptXFps484.Engine]::Diagnostic())
         }
     } finally { Stop-Fps433Engine }
     return
@@ -2048,20 +2086,6 @@ $script:Config = @{
    </Setter.Value></Setter>
   </Style>
 
-  <!-- Black text-shadows only: separate underlays for the 4 hardware cards. -->
-  <Style x:Key="HardwareBlackTextShadow" TargetType="TextBlock">
-   <Setter Property="Foreground" Value="#000000"/>
-   <Setter Property="IsHitTestVisible" Value="False"/>
-   <Setter Property="RenderTransform">
-    <Setter.Value><TranslateTransform X="1.25" Y="1.6"/></Setter.Value>
-   </Setter>
-   <Setter Property="Effect">
-    <Setter.Value>
-     <DropShadowEffect Color="#000000" Direction="270" ShadowDepth="1.8"
-                       BlurRadius="2.3" Opacity="1"/>
-    </Setter.Value>
-   </Setter>
-  </Style>
 
   <!-- A single translucent tint lets the window's dithered graphite show through. -->
   <SolidColorBrush x:Key="InsetGlass" Color="#06A4B5CA"/>
@@ -2287,6 +2311,12 @@ $script:Config = @{
    </Setter>
   </Style>
 
+  <DrawingImage x:Key="ScriptXMark">
+   <DrawingImage.Drawing>
+    <GeometryDrawing Brush="#AFBDFF" Geometry="M1,1 H5.4 L10,7.7 L14.5,1 H19 L12.3,10.2 L19.3,20 H14.6 L9.9,13 L5.2,20 H0.7 L7.6,10.2 Z"/>
+   </DrawingImage.Drawing>
+  </DrawingImage>
+
   <DrawingImage x:Key="CpuArtwork">
    <DrawingImage.Drawing>
     <DrawingGroup>
@@ -2439,10 +2469,14 @@ $script:Config = @{
     <StackPanel Orientation="Horizontal" HorizontalAlignment="Right"
                 VerticalAlignment="Center" Margin="0,0,8,0"
                 >
-     <Button shell:WindowChrome.IsHitTestVisibleInChrome="True" x:Name="Minimize" Content="" FontFamily="Segoe MDL2 Assets"
-             Width="32" Height="30" Padding="6"/>
-     <Button shell:WindowChrome.IsHitTestVisibleInChrome="True" x:Name="Close" Content="" FontFamily="Segoe MDL2 Assets"
-             Width="32" Height="30" Padding="6"/>
+     <Button shell:WindowChrome.IsHitTestVisibleInChrome="True" x:Name="Minimize" AutomationProperties.Name="Minimize"
+             Width="32" Height="30" Padding="6">
+      <Path Width="12" Height="12" Data="M1,6 H11" Stroke="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}" StrokeThickness="1.2"/>
+     </Button>
+     <Button shell:WindowChrome.IsHitTestVisibleInChrome="True" x:Name="Close" AutomationProperties.Name="Close"
+             Width="32" Height="30" Padding="6">
+      <Path Width="12" Height="12" Data="M1,1 L11,11 M11,1 L1,11" Stroke="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}" StrokeThickness="1.2"/>
+     </Button>
     </StackPanel>
     <!-- Continuous hairline under the header, with no separate header fill. -->
     <Border VerticalAlignment="Bottom" Height="1" IsHitTestVisible="False">
@@ -2471,19 +2505,21 @@ $script:Config = @{
         <Border Style="{StaticResource CardSurface}"
                 Padding="10" CornerRadius="15">
          <StackPanel>
-          <StackPanel Orientation="Horizontal">
+          <Grid>
+           <Grid.ColumnDefinitions><ColumnDefinition Width="30"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
            <Border Width="30" Height="30" CornerRadius="15"
                    Background="#35445D78" BorderBrush="#28FFFFFF" BorderThickness="0.8">
             <TextBlock Text="X" HorizontalAlignment="Center"
                        VerticalAlignment="Center" FontSize="15"
                        Foreground="#DCECF6" x:Name="Avatar"/>
            </Border>
-           <StackPanel Margin="9,2,0,0">
-            <TextBlock Text="Your account" FontWeight="SemiBold" x:Name="ProfileName"/>
-            <TextBlock Text="LOCAL PROFILE" Style="{StaticResource Label}"
-                       FontSize="7" x:Name="ProfileMachine"/>
+           <StackPanel Grid.Column="1" Margin="9,2,0,0">
+            <TextBlock Text="Local account" FontWeight="SemiBold" x:Name="ProfileName"
+                       TextWrapping="NoWrap" TextTrimming="CharacterEllipsis"/>
+            <TextBlock Text="Local PC" Style="{StaticResource Label}" TextWrapping="NoWrap"
+                       TextTrimming="CharacterEllipsis" FontSize="7" x:Name="ProfileMachine"/>
            </StackPanel>
-          </StackPanel>
+          </Grid>
           <TextBlock Text="● LOCAL MONITOR" Style="{StaticResource Label}"
                      FontSize="7" Margin="0,12,0,0" x:Name="ProfileStatus"/>
          </StackPanel>
@@ -2494,9 +2530,8 @@ $script:Config = @{
         <StackPanel Orientation="Horizontal" Margin="1,0,0,29">
          <Border Width="44" Height="44" Background="#35435B80"
                  CornerRadius="15" BorderThickness="1" BorderBrush="#30FFFFFF">
-          <TextBlock Text="X" Foreground="#AFBDFF" FontSize="25"
-                     FontFamily="Segoe UI" FontWeight="Bold" HorizontalAlignment="Center"
-                     VerticalAlignment="Center"/>
+          <Image Source="{StaticResource ScriptXMark}" Width="18" Height="20"
+                 Stretch="Uniform" HorizontalAlignment="Center" VerticalAlignment="Center"/>
          </Border>
          <StackPanel Margin="8,3,0,0" VerticalAlignment="Center">
           <TextBlock FontSize="18" FontWeight="Bold" FontFamily="Segoe UI" Foreground="#F3F3FF" TextWrapping="NoWrap">
@@ -2510,7 +2545,10 @@ $script:Config = @{
         <Button x:Name="Home" Tag="Home" Background="{StaticResource NavSelectedGlass}"
                 Foreground="#DDE3ED" Margin="0,0,0,8" HorizontalContentAlignment="Left" FontSize="11" FontWeight="Bold" Padding="11,11">
          <StackPanel Orientation="Horizontal">
-          <TextBlock Text="" FontFamily="Segoe MDL2 Assets" FontSize="15" Margin="0,0,12,0"/>
+          <Viewbox Width="15" Height="15" Margin="0,0,12,0"><Canvas Width="16" Height="16">
+           <Path Data="M1,8 L8,2 L15,8 M3.5,7 V14 H7 V10 H9 V14 H12.5 V7" Stroke="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}"
+                 StrokeThickness="1.4" StrokeLineJoin="Round" StrokeStartLineCap="Round" StrokeEndLineCap="Round"/>
+          </Canvas></Viewbox>
           <TextBlock Text="HOME" FontWeight="Bold" FontSize="11"/>
          </StackPanel>
         </Button>
@@ -2522,7 +2560,10 @@ $script:Config = @{
         <Button x:Name="Boost" Tag="FPS TWEAK" Background="Transparent"
                 Foreground="#9EAFBF" Margin="0,0,0,8" HorizontalContentAlignment="Left" FontSize="11" FontWeight="Bold" Padding="11,11">
          <StackPanel Orientation="Horizontal">
-          <TextBlock Text="" FontFamily="Segoe MDL2 Assets" FontSize="15" Margin="0,0,12,0"/>
+          <Viewbox Width="15" Height="15" Margin="0,0,12,0"><Canvas Width="16" Height="16">
+           <Path Data="M8,1 L3,9 H7.5 L6.5,15 L13,6.8 H8.5 Z" Stroke="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}"
+                 StrokeThickness="1.4" StrokeLineJoin="Round" StrokeStartLineCap="Round" StrokeEndLineCap="Round"/>
+          </Canvas></Viewbox>
           <TextBlock Text="FPS TWEAK" FontWeight="Bold" FontSize="11"/>
          </StackPanel>
         </Button>
@@ -2530,7 +2571,10 @@ $script:Config = @{
         <Button x:Name="Latency" Tag="Latency" Background="Transparent"
                 Foreground="#9EAFBF" Margin="0,0,0,8" HorizontalContentAlignment="Left" FontSize="11" FontWeight="Bold" Padding="11,11">
          <StackPanel Orientation="Horizontal">
-          <TextBlock Text="" FontFamily="Segoe MDL2 Assets" FontSize="15" Margin="0,0,12,0"/>
+          <Viewbox Width="15" Height="15" Margin="0,0,12,0"><Canvas Width="16" Height="16">
+           <Path Data="M8,1 L3,9 H7.5 L6.5,15 L13,6.8 H8.5 Z" Stroke="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}"
+                 StrokeThickness="1.4" StrokeLineJoin="Round" StrokeStartLineCap="Round" StrokeEndLineCap="Round"/>
+          </Canvas></Viewbox>
           <TextBlock Text="LATENCY" FontWeight="Bold" FontSize="11"/>
          </StackPanel>
         </Button>
@@ -2538,7 +2582,10 @@ $script:Config = @{
         <Button x:Name="Network" Tag="Network" Background="Transparent"
                 Foreground="#9EAFBF" Margin="0,0,0,8" HorizontalContentAlignment="Left" FontSize="11" FontWeight="Bold" Padding="11,11">
          <StackPanel Orientation="Horizontal">
-          <TextBlock Text="" FontFamily="Segoe MDL2 Assets" FontSize="15" Margin="0,0,12,0"/>
+          <Viewbox Width="15" Height="15" Margin="0,0,12,0"><Canvas Width="16" Height="16">
+           <Path Data="M1,5 Q8,-1 15,5 M3.5,8 Q8,4 12.5,8 M6,10.7 Q8,9 10,10.7 M7.8,13 H8.2" Stroke="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}"
+                 StrokeThickness="1.4" StrokeLineJoin="Round" StrokeStartLineCap="Round" StrokeEndLineCap="Round"/>
+          </Canvas></Viewbox>
           <TextBlock Text="NETWORK" FontWeight="Bold" FontSize="11"/>
          </StackPanel>
         </Button>
@@ -2550,7 +2597,10 @@ $script:Config = @{
         <Button x:Name="Cleanup" Tag="Clean Up" Background="Transparent"
                 Foreground="#9EAFBF" Margin="0,0,0,8" HorizontalContentAlignment="Left" FontSize="11" FontWeight="Bold" Padding="11,11">
          <StackPanel Orientation="Horizontal">
-          <TextBlock Text="" FontFamily="Segoe MDL2 Assets" FontSize="15" Margin="0,0,12,0"/>
+          <Viewbox Width="15" Height="15" Margin="0,0,12,0"><Canvas Width="16" Height="16">
+           <Path Data="M7.8,7.2 L13.7,1.3 M5,6.8 L9.5,11.3 L7.6,14.8 L1,8.8 Z M3.5,9 L6.7,12.2" Stroke="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}"
+                 StrokeThickness="1.4" StrokeLineJoin="Round" StrokeStartLineCap="Round" StrokeEndLineCap="Round"/>
+          </Canvas></Viewbox>
           <TextBlock Text="CLEAN UP" FontWeight="Bold" FontSize="11"/>
          </StackPanel>
         </Button>
@@ -2629,7 +2679,7 @@ $script:Config = @{
          <Border Style="{StaticResource Icon}" Padding="10,6" Margin="5,0,0,0">
           <StackPanel>
            <TextBlock Text="L O C A L" Style="{StaticResource Label}" FontSize="8" FontWeight="Bold"/>
-           <TextBlock x:Name="Clock" Text="00:00:00"
+           <TextBlock x:Name="Clock" Text="&#x2014;"
                       FontSize="10" Margin="0,3,0,0"/>
           </StackPanel>
          </Border>
@@ -2663,7 +2713,7 @@ $script:Config = @{
             <ColumnDefinition Width="Auto"/>
             <ColumnDefinition Width="*"/>
            </Grid.ColumnDefinitions>
-           <TextBlock x:Name="FpsStatusText" Grid.Column="1" Text="Starting capture"
+           <TextBlock x:Name="FpsStatusText" ToolTipService.IsEnabled="True" Grid.Column="1" Text="Starting capture"
                       Foreground="#A1B4C3" FontSize="10" Margin="6,5,0,0"
                       TextAlignment="Right" TextTrimming="CharacterEllipsis" VerticalAlignment="Top"/>
            <Border x:Name="FpsProcessBadge" HorizontalAlignment="Left"
@@ -2767,23 +2817,22 @@ $script:Config = @{
              <StackPanel.RenderTransform>
               <TranslateTransform Y="2"/>
              </StackPanel.RenderTransform>
+            <Grid>
+             <TextBlock Text="&#x2014;" FontSize="38" TextAlignment="Center" Foreground="#8D9DAD">
+              <TextBlock.Style><Style TargetType="TextBlock">
+               <Setter Property="Visibility" Value="Collapsed"/>
+               <Style.Triggers><DataTrigger Binding="{Binding Text, ElementName=FpsLive}" Value="">
+                <Setter Property="Visibility" Value="Visible"/>
+               </DataTrigger></Style.Triggers>
+              </Style></TextBlock.Style>
+             </TextBlock>
             <TextBlock x:Name="FpsLive" Text="" FontSize="38" FontWeight="Bold"
                        TextAlignment="Center" MinWidth="95" Foreground="#F8F5FF"
                        TextWrapping="NoWrap" TextOptions.TextFormattingMode="Ideal"
                        HorizontalAlignment="Center"/>
+            </Grid>
             <TextBlock x:Name="FpsUnitLabel" Text="F P S" FontSize="10.3" FontWeight="SemiBold"
-                       Foreground="#9EE5FF" HorizontalAlignment="Center" Margin="0,-1,0,0">
-             <TextBlock.Style>
-              <Style TargetType="TextBlock">
-               <Setter Property="Opacity" Value="1"/>
-               <Style.Triggers>
-                <DataTrigger Binding="{Binding Text, ElementName=FpsLive}" Value="">
-                 <Setter Property="Opacity" Value="0"/>
-                </DataTrigger>
-               </Style.Triggers>
-              </Style>
-             </TextBlock.Style>
-            </TextBlock>
+                       Foreground="#9EE5FF" HorizontalAlignment="Center" Margin="0,-1,0,0"/>
            </StackPanel>
           </Grid>
 
@@ -2882,9 +2931,6 @@ $script:Config = @{
               </Border>
               <StackPanel Grid.Column="1" VerticalAlignment="Center" Margin="2,0,0,0">
                <Grid>
-                <!-- Black offset-shadow underlay; foreground title remains ClearType/sharp. -->
-                <TextBlock Text="CPU" FontSize="16" FontWeight="Bold"
-                           Style="{StaticResource HardwareBlackTextShadow}" TextWrapping="NoWrap"/>
                 <TextBlock Text="CPU" FontSize="16" FontWeight="Bold"
                            Foreground="#F5F3FF" TextWrapping="NoWrap"/>
                </Grid>
@@ -2903,9 +2949,6 @@ $script:Config = @{
                <ColumnDefinition Width="Auto"/>
               </Grid.ColumnDefinitions>
               <Grid Grid.Column="0" VerticalAlignment="Center">
-               <TextBlock Text="{Binding Text, ElementName=CpuValue}" FontSize="24"
-                          FontWeight="Bold" VerticalAlignment="Center" TextWrapping="NoWrap"
-                          Style="{StaticResource HardwareBlackTextShadow}"/>
                <TextBlock x:Name="CpuValue" Text="—" FontSize="24"
                          FontWeight="Bold" VerticalAlignment="Center" TextWrapping="NoWrap"/>
               </Grid>
@@ -2955,9 +2998,6 @@ $script:Config = @{
               </Border>
               <StackPanel Grid.Column="1" VerticalAlignment="Center" Margin="2,0,0,0">
                <Grid>
-                <!-- Black offset-shadow underlay; foreground title remains ClearType/sharp. -->
-                <TextBlock Text="GPU" FontSize="16" FontWeight="Bold"
-                           Style="{StaticResource HardwareBlackTextShadow}" TextWrapping="NoWrap"/>
                 <TextBlock Text="GPU" FontSize="16" FontWeight="Bold"
                            Foreground="#F5F3FF" TextWrapping="NoWrap"/>
                </Grid>
@@ -2976,9 +3016,6 @@ $script:Config = @{
                <ColumnDefinition Width="Auto"/>
               </Grid.ColumnDefinitions>
               <Grid Grid.Column="0" VerticalAlignment="Center">
-               <TextBlock Text="{Binding Text, ElementName=GpuValue}" FontSize="24"
-                          FontWeight="Bold" VerticalAlignment="Center" TextWrapping="NoWrap"
-                          Style="{StaticResource HardwareBlackTextShadow}"/>
                <TextBlock x:Name="GpuValue" Text="—" FontSize="24"
                          FontWeight="Bold" VerticalAlignment="Center" TextWrapping="NoWrap"/>
               </Grid>
@@ -3028,9 +3065,6 @@ $script:Config = @{
               </Border>
               <StackPanel Grid.Column="1" VerticalAlignment="Center" Margin="2,0,0,0">
                <Grid>
-                <!-- Black offset-shadow underlay; foreground title remains ClearType/sharp. -->
-                <TextBlock Text="RAM" FontSize="16" FontWeight="Bold"
-                           Style="{StaticResource HardwareBlackTextShadow}" TextWrapping="NoWrap"/>
                 <TextBlock Text="RAM" FontSize="16" FontWeight="Bold"
                            Foreground="#F5F3FF" TextWrapping="NoWrap"/>
                </Grid>
@@ -3049,9 +3083,6 @@ $script:Config = @{
                <ColumnDefinition Width="Auto"/>
               </Grid.ColumnDefinitions>
               <Grid Grid.Column="0" VerticalAlignment="Center">
-               <TextBlock Text="{Binding Text, ElementName=RamValue}" FontSize="24"
-                          FontWeight="Bold" VerticalAlignment="Center" TextWrapping="NoWrap"
-                          Style="{StaticResource HardwareBlackTextShadow}"/>
                <TextBlock x:Name="RamValue" Text="—" FontSize="24"
                          FontWeight="Bold" VerticalAlignment="Center" TextWrapping="NoWrap"/>
               </Grid>
@@ -3101,9 +3132,6 @@ $script:Config = @{
               </Border>
               <StackPanel Grid.Column="1" VerticalAlignment="Center" Margin="2,0,0,0">
                <Grid>
-                <!-- Black offset-shadow underlay; foreground title remains ClearType/sharp. -->
-                <TextBlock Text="TEMP" FontSize="16" FontWeight="Bold"
-                           Style="{StaticResource HardwareBlackTextShadow}" TextWrapping="NoWrap"/>
                 <TextBlock Text="TEMP" FontSize="16" FontWeight="Bold"
                            Foreground="#F5F3FF" TextWrapping="NoWrap"/>
                </Grid>
@@ -3122,9 +3150,6 @@ $script:Config = @{
                <ColumnDefinition Width="Auto"/>
               </Grid.ColumnDefinitions>
               <Grid Grid.Column="0" VerticalAlignment="Center">
-               <TextBlock Text="{Binding Text, ElementName=TempValue}" FontSize="24"
-                          FontWeight="Bold" VerticalAlignment="Center" TextWrapping="NoWrap"
-                          Style="{StaticResource HardwareBlackTextShadow}"/>
                <TextBlock x:Name="TempValue" Text="—" FontSize="24"
                          FontWeight="Bold" VerticalAlignment="Center" TextWrapping="NoWrap"/>
               </Grid>
@@ -3369,6 +3394,7 @@ $window = [Windows.Markup.XamlReader]::Load(
     (New-Object Xml.XmlNodeReader $markup)
 )
 $window.FontFamily = $script:UiFontFamily
+$window.Icon = $window.FindResource('ScriptXMark')
 
 # Load the dithered background once for the window and its translucent cards.
 $backdropBytes = [Convert]::FromBase64String(@'
@@ -3872,12 +3898,12 @@ if ($script:FpsNativeGaugeReady) {
     catch { Write-HsStartupLog ('FPS_VISUAL_INIT_FALLBACK: ' + ($_ | Out-String)) }
 }
 
-$ui.ProfileName.Text = $env:USERNAME
-$ui.ProfileMachine.Text = $env:COMPUTERNAME
-
 if ($env:USERNAME) {
-    $ui.Avatar.Text = $env:USERNAME.Substring(0, 1).ToUpperInvariant()
+    $ui.ProfileName.Text = $env:USERNAME
+    $ui.Avatar.Text = [Globalization.StringInfo]::GetNextTextElement($env:USERNAME).ToUpperInvariant()
 }
+if ($env:COMPUTERNAME) { $ui.ProfileMachine.Text = $env:COMPUTERNAME }
+$ui.Clock.Text = Get-Date -Format 'HH:mm:ss'
 
 # Preserve the original On Top headline font on BOTH stacked words.
 $ui.DashboardHeading.FontFamily = $script:DashboardFontFamily
@@ -4501,7 +4527,8 @@ function Show-Reading($d) {
 
     Update-ShowSpec $d $displayGpu
 
-    $ui.ProfileStatus.Text = if ($complete) { '● CONNECTED' } else { '● PARTIAL DATA' }
+    $hasReadings = $null -ne $d.Cpu -and $null -ne $d.MemoryPercent -and $null -ne $displayGpu.Load
+    $ui.ProfileStatus.Text = if ($hasReadings) { '● CONNECTED' } else { '● PARTIAL DATA' }
     $ui.ProviderStatus.Text = ''
 
 }
@@ -5818,14 +5845,11 @@ $timer.Add_Tick({
                 throw 'No telemetry snapshot returned'
             }
 
-            if ($worker.Streams.Error.Count) {
-                throw 'A telemetry provider failed'
-            }
-
             Show-Reading $r[-1]
         }
         catch {
             $ui.Connection.Text = '● DATA UNAVAILABLE / RETRYING'
+            $ui.ProfileStatus.Text = '● RETRYING'
             Show-NetworkReading $null
             $script:LastHealthResult=$null
             Reset-SystemHealth 'DATA UNAVAILABLE'
@@ -5848,6 +5872,7 @@ $timer.Add_Tick({
             [math]::Max(10000, 4 * $script:Config.RefreshMs)
     ) {
         $ui.Connection.Text = '● STALE DATA / WAITING FOR PROVIDERS'
+        $ui.ProfileStatus.Text = '● DATA DELAYED'
         Show-NetworkReading $null
         $script:LastHealthResult=$null
         Reset-SystemHealth 'DATA UNAVAILABLE'
@@ -5909,7 +5934,8 @@ $window.Add_ContentRendered({
     # once after the first content paint.
     $script:UiInitialized = $true
     try {
-        Start-Reading
+        try { Start-Reading }
+        catch { Write-HsStartupLog ('TELEMETRY_START_FAILED: ' + $_.Exception.Message) }
         Start-Fps433Engine
         Update-RealGameFps
         Update-FpsRingProgress
