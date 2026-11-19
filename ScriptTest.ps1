@@ -1,4 +1,4 @@
-﻿#requires -Version 5.1
+#requires -Version 5.1
 # SCRIPT X 5.37 - GRAPHITE DEPTH / SMOKED BORDERLESS FROSTED GLASS
 # Background: static black and subtle graphite gradients; no background animation.
 # The dashboard's FPS and hardware animations are retained.
@@ -142,7 +142,7 @@ Add-Type -AssemblyName PresentationFramework,PresentationCore,WindowsBase
 # MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
 $script:Fps433Ready = $false
 try {
-    if (-not ('ScriptXFps472.Engine' -as [type])) {
+    if (-not ('ScriptXFps483.Engine' -as [type])) {
         Add-Type -TypeDefinition @'
 using System;
 using System.Collections.Generic;
@@ -156,7 +156,7 @@ using System.Threading;
 using System.Runtime.InteropServices;
 using Microsoft.Win32.SafeHandles;
 
-namespace ScriptXFps472 {
+namespace ScriptXFps483 {
     public sealed class Snapshot {
         public string State="STARTING", Detail="", Game="", Source="", Identity="", Chain="", ExitedIdentity="";
         public string CaptureStatus="STARTING", RtssStatus="STARTING", Session="", Evidence="UNKNOWN";
@@ -195,7 +195,7 @@ namespace ScriptXFps472 {
         internal int Pid;
         internal string Name;
         internal long StartTicks, Seen, IdentityChecked;
-        internal bool Alive, Verified, Visible;
+        internal bool Alive, Verified;
         internal SafeWaitHandle Lifetime;
         internal string IdentityStatus="PENDING";
         internal int[] Ancestors=new int[0];
@@ -320,17 +320,21 @@ namespace ScriptXFps472 {
                     App child=null;int matches=0;
                     foreach(App a in Apps.Values) if(HasFrames(a,now) && BelongsToFocus(a,foreground)) { child=a;matches++; }
                     if(matches==1) selected=child;
+                    if(matches>1) {
+                        TargetPid=0;TargetIdentity="";
+                        return new Snapshot {State="MULTIPLE_RENDERERS",Detail="Multiple focused child renderers. Use -FpsTargetPid."};
+                    }
                 }
-                if(selected==null) selected=pinned; // Retain identity even if both sources go silent.
-                if(selected==null) {
-                    App only=null;int matches=0;
-                    foreach(App a in Apps.Values) if(a.Visible && HasFrames(a,now)) { only=a;matches++; }
-                    if(matches==1) selected=only;
-                    else if(matches>1) return new Snapshot {State="MULTIPLE_RENDERERS",Detail="Focus a renderer or use -FpsTargetPid."};
-                }
+                // Only retain a previously attributed identity on Alt+Tab. A visible singleton
+                // elsewhere on the desktop is not evidence of which game the user is playing.
+                if(selected==null) selected=pinned;
             }
             if(selected==null) {
                 TargetPid=0;TargetIdentity="";
+                App unverified;
+                if(Apps.TryGetValue(RequestedPid>0?RequestedPid:foreground,out unverified) &&
+                    !unverified.Verified && unverified.IdentityStatus=="OPEN_DENIED_OR_UNAVAILABLE")
+                    return new Snapshot {State="IDENTITY_UNAVAILABLE",ExitedIdentity=ConfirmedExitedIdentity};
                 return new Snapshot {State=RequestedPid>0?"TARGET_NOT_OBSERVED":"WAITING_FOR_GAME",
                     ExitedIdentity=ConfirmedExitedIdentity};
             }
@@ -353,7 +357,7 @@ namespace ScriptXFps472 {
                     if(sum>0) stats.Avg=1000.0*all.Count/sum;
                     all.Sort();int worst=(int)Math.Ceiling(all.Count*0.01);double slow=0;
                     for(int i=all.Count-worst;i<all.Count;i++) slow+=all[i];
-                    stats.Low=slow>0?1000.0*worst/slow:0;
+                    stats.Low=all.Count>=100 && slow>0?1000.0*worst/slow:0;
                     stream.Peak=Math.Max(stream.Peak,stats.Fps);stats.Peak=stream.Peak;
                     stats.Frames=all.Count;stream.Stats=stats;stream.StatsVersion=stream.Version;
                 }
@@ -397,8 +401,13 @@ namespace ScriptXFps472 {
         private static readonly ManualResetEvent StopSignal=new ManualResetEvent(false);
         private static readonly int OwnPid=Process.GetCurrentProcess().Id;
         private static readonly string[] Exclusions={"dwm.exe","explorer.exe","powershell.exe","pwsh.exe","code.exe",
-            "rtss.exe","chrome.exe","msedge.exe","firefox.exe","steamwebhelper.exe","discord.exe","taskmgr.exe",
+            "rtss.exe","steamwebhelper.exe","discord.exe","taskmgr.exe",
             "windowsterminal.exe","searchhost.exe","gamebar.exe","presentmon.exe",FileName,"PresentMonConsole.exe"};
+        // Browser renderers may be legitimate explicit targets for a browser game.
+        private static readonly HashSet<string> DesktopRenderers=new HashSet<string>(StringComparer.OrdinalIgnoreCase) {
+            "brave.exe","chrome.exe","msedge.exe","firefox.exe","opera.exe","vivaldi.exe","msedgewebview2.exe",
+            "obs64.exe","obs32.exe","streamlabs desktop.exe","steam.exe","epicgameslauncher.exe","overwolf.exe"
+        };
         private static MonitorCore core=new MonitorCore();
         private static Snapshot latest=new Snapshot();
         private static string engineRoot,scriptRoot,logPath,activeSession="",captureStatus="STOPPED",rtssStatus="STARTING";
@@ -509,6 +518,8 @@ namespace ScriptXFps472 {
         }
         private static bool IsExcluded(int pid,string name) {
             if(pid<=4 || pid==OwnPid) return true;
+            if(core.RequestedPid>0 && pid!=core.RequestedPid) return true;
+            if(pid!=core.RequestedPid && DesktopRenderers.Contains(name)) return true;
             foreach(string n in Exclusions) if(name.Equals(n,StringComparison.OrdinalIgnoreCase)) return true;
             return false;
         }
@@ -617,7 +628,8 @@ namespace ScriptXFps472 {
             string s=error??"";
             if (s.IndexOf("error code 1450",StringComparison.OrdinalIgnoreCase)>=0 ||
                 s.IndexOf("0x000005aa",StringComparison.OrdinalIgnoreCase)>=0 ||
-                s.IndexOf("0x5aa",StringComparison.OrdinalIgnoreCase)>=0)
+                s.IndexOf("0x5aa",StringComparison.OrdinalIgnoreCase)>=0 ||
+                s.IndexOf("0x800705aa",StringComparison.OrdinalIgnoreCase)>=0)
                 return "ETW_RESOURCE_LIMIT";
             if (s.IndexOf("failed to start trace session: access denied",StringComparison.OrdinalIgnoreCase)>=0 ||
                 s.IndexOf("error code 5.",StringComparison.OrdinalIgnoreCase)>=0)
@@ -655,7 +667,13 @@ namespace ScriptXFps472 {
         }
         private static void Run() {
             try {
-                string path=Provision();if(path==null || stopped) return;
+                string path=null;
+                int retrySeconds=60;
+                while(!stopped && (path=Provision())==null) {
+                    if(!Environment.Is64BitOperatingSystem || StopSignal.WaitOne(retrySeconds*1000)) return;
+                    retrySeconds=Math.Min(300,retrySeconds*2);
+                }
+                if(stopped) return;
                 int attempt=0;
                 while(!stopped) {
                     string failure="";ResetCapture();
@@ -666,6 +684,13 @@ namespace ScriptXFps472 {
                     // v1 + qpc_time has a documented QPCTime/SwapChainAddress/msBetweenPresents schema in 2.3.1.
                     p.StartInfo.Arguments="--session_name "+session+
                         " --output_stdout --v1_metrics --qpc_time --no_track_display --no_track_gpu --no_track_input";
+                    if(core.RequestedPid>0)
+                        p.StartInfo.Arguments+=" --process_id "+core.RequestedPid.ToString(CultureInfo.InvariantCulture);
+                    else {
+                        // Filter at the producer so desktop and capture tools do not fill the CSV pipe.
+                        foreach(string name in DesktopRenderers) p.StartInfo.Arguments+=" --exclude \""+name+"\"";
+                        foreach(string name in Exclusions) p.StartInfo.Arguments+=" --exclude \""+name+"\"";
+                    }
                     p.StartInfo.UseShellExecute=false;p.StartInfo.RedirectStandardOutput=true;
                     p.StartInfo.RedirectStandardError=true;p.StartInfo.CreateNoWindow=true;
                     p.StartInfo.WindowStyle=ProcessWindowStyle.Hidden;
@@ -731,7 +756,8 @@ namespace ScriptXFps472 {
             string[] f=Csv(line);
             lock(DataGate) {
                 lines++;lastRow=now;readerStatus="READING";
-                if(Index(f,"Application")>=0 && Index(f,"ProcessID")>=0) {
+                if((!schemaReady || f[0].Trim().Equals("Application",StringComparison.OrdinalIgnoreCase)) &&
+                    Index(f,"Application")>=0 && Index(f,"ProcessID")>=0) {
                     appColumn=Index(f,"Application");pidColumn=Index(f,"ProcessID");msColumn=Index(f,"msBetweenPresents");
                     chainColumn=Index(f,"SwapChainAddress");qpcColumn=Index(f,"QPCTime");
                     schemaReady=appColumn>=0 && pidColumn>=0 && msColumn>=0 && chainColumn>=0 && qpcColumn>=0;
@@ -808,11 +834,6 @@ namespace ScriptXFps472 {
                             if(wait==0) { ForgetApp(a,"PROCESS_EXITED");continue; }
                             a.IdentityStatus=wait==258?"VERIFIED_HANDLE":"LIFETIME_CHECK_UNCONFIRMED";
                         }
-                        if(wait==258 && !a.Visible) {
-                            bool visible;
-                            using(Process p=Process.GetProcessById(a.Pid)) visible=p.MainWindowHandle!=IntPtr.Zero;
-                            lock(DataGate) if(CurrentApp(a)) a.Visible=visible;
-                        }
                     } else {
                         IntPtr raw=OpenProcess(0x00101000,false,a.Pid); // SYNCHRONIZE | QUERY_LIMITED_INFORMATION only
                         if(raw==IntPtr.Zero) {
@@ -829,9 +850,9 @@ namespace ScriptXFps472 {
                         long created,exitTime,kernel,user;
                         if(!GetProcessTimes(opened,out created,out exitTime,out kernel,out user)) continue;
                         long start=DateTime.FromFileTimeUtc(created).Ticks;
-                        string actual;bool visible;int[] parents;
+                        string actual;int[] parents;
                         using(Process p=Process.GetProcessById(a.Pid)) {
-                            actual=p.ProcessName+".exe";visible=p.MainWindowHandle!=IntPtr.Zero;parents=Ancestors(p,opened);
+                            actual=p.ProcessName+".exe";parents=Ancestors(p,opened);
                         }
                         if(WaitForSingleObject(opened,0)==0) {
                             lock(DataGate) ForgetApp(a,"PROCESS_EXITED");continue;
@@ -848,7 +869,7 @@ namespace ScriptXFps472 {
                                 if(c.Last<born) preBirth.Add(c.Key);
                             }
                             foreach(string key in preBirth) a.Streams.Remove(key);
-                            a.StartTicks=start;a.Alive=true;a.Verified=true;a.Visible=visible;a.Ancestors=parents;
+                            a.StartTicks=start;a.Alive=true;a.Verified=true;a.Ancestors=parents;
                             a.IdentityStatus="VERIFIED_HANDLE";a.Lifetime=opened;opened=null;
                         }
                     }
@@ -963,7 +984,7 @@ namespace ScriptXFps472 {
 
 '@ -IgnoreWarnings -ErrorAction Stop
     }
-    $script:Fps433Ready = ('ScriptXFps472.Engine' -as [type]) -ne $null
+    $script:Fps433Ready = ('ScriptXFps483.Engine' -as [type]) -ne $null
 } catch {
     Write-HsStartupLog ('FPS_COMPILE_FAILED: ' + ($_ | Out-String))
 }
@@ -971,21 +992,20 @@ $script:Fps433EngineRoot = Join-Path $env:LOCALAPPDATA 'ScriptX\Engines'
 $script:Fps433Log = Join-Path $env:LOCALAPPDATA 'ScriptX\fps-diagnostics.log'
 function Start-Fps433Engine {
     if ($script:Fps433Ready) {
-        [ScriptXFps472.Engine]::Start($script:Fps433EngineRoot, $PSScriptRoot,
+        [ScriptXFps483.Engine]::Start($script:Fps433EngineRoot, $PSScriptRoot,
             $script:Fps433Log, [bool]($FpsDiagnostics -or $FpsProbe), [int]$FpsTargetPid)
     }
 }
 function Stop-Fps433Engine {
-    if ($script:Fps433Ready) { [ScriptXFps472.Engine]::Stop() }
+    if ($script:Fps433Ready) { [ScriptXFps483.Engine]::Stop() }
 }
 
-# FPS-only compositor: WPF linear clocks track genuine samples without the
-# previous restart/ease-out jolt; number reads the same animated arc position.
+# FPS-only compositor. The arc animates while the number reports the latest sample.
 # Single active-ring shadow follows the existing WPF animated stroke; no second arc.
 # No new timer, extra game sampling, synthetic FPS readings, or endless loop.
 $script:FpsNativeGaugeReady = $false
 try {
-    if (-not ('ScriptXVisual476.FluidFpsGauge' -as [type])) {
+    if (-not ('ScriptXVisual483.FluidFpsGauge' -as [type])) {
         $fpsRendererSource = @'
 using System;
 using System.Diagnostics;
@@ -996,17 +1016,17 @@ using System.Windows.Media;
 using System.Windows.Media.Animation;
 using System.Windows.Shapes;
 
-namespace ScriptXVisual476 {
+namespace ScriptXVisual483 {
     // Genuine FPS samples only; animation is display interpolation, never capture.
     // Retarget the native WPF clocks linearly: no repeated ease-out / stop-go at
-    // the ~250 ms sampling boundary. Text reads the same animated arc position.
+    // the ~250 ms sampling boundary. The label reports the measured sample.
     public sealed class FluidFpsGauge : IDisposable {
         private const double DashLength = 43.93;
         // Optional halo support remains for compatibility; current XAML uses
         // only the 8px active path with a lightweight glow effect.
         private const double GlowDashRatio = 8.0 / 13.0;
-        private const double VisualScale = 360.0;
-        private const double MinArc = 0.06;
+        private double targetOffset;
+
         private const double ArcEpsilon = 0.004;
         // Each WPF compositor path has its own synchronized native clock.
         // Both use the original 8px gauge geometry; the halo has a wider pen.
@@ -1019,10 +1039,6 @@ namespace ScriptXVisual476 {
         private string drawnLabel;
         private long rateTick;
         private int framesSinceRate;
-        // TextBlock.Text invalidates WPF text layout. Do not rebuild it on
-        // every frame of the animated path, particularly on layered HWNDs.
-        private long lastTextTick;
-        private const double TextIntervalMs = 30.0; // ~30 text updates/s at most
         private double worstRenderGapMs;
         private long previousRenderTick;
 
@@ -1044,16 +1060,6 @@ namespace ScriptXVisual476 {
         public double WorstRenderGapMs { get { return worstRenderGapMs; } }
         public bool IsHeld { get { return held; } }
 
-        private static double OffsetFor(double fps) {
-            double fraction = fps > 0.0 ? Math.Max(MinArc, Math.Min(1.0, fps / VisualScale)) : 0.0;
-            return DashLength * (1.0 - fraction);
-        }
-
-        private static double FpsForOffset(double offset) {
-            return Math.Max(0.0, Math.Min(VisualScale,
-                (1.0 - offset / DashLength) * VisualScale));
-        }
-
         private static void CancelClock(Path path) {
             if (path == null) return;
             double displayed = path.StrokeDashOffset;
@@ -1066,9 +1072,9 @@ namespace ScriptXVisual476 {
             CancelClock(glow);
         }
 
-        private void SnapArc(double fps) {
+        private void SnapArc() {
             StopArcClock();
-            double offset = OffsetFor(fps);
+            double offset = targetOffset;
             ring.StrokeDashOffset = offset;
             if (glow != null) glow.StrokeDashOffset = offset * GlowDashRatio;
         }
@@ -1090,10 +1096,10 @@ namespace ScriptXVisual476 {
                 HandoffBehavior.SnapshotAndReplace);
         }
 
-        private void AnimateArc(double fps, bool exit) {
+        private void AnimateArc(bool exit) {
             if (!visible) return;
             double from = ring.StrokeDashOffset;
-            double to = exit ? DashLength : OffsetFor(fps);
+            double to = exit ? DashLength : targetOffset;
             double glowFrom = glow != null ? glow.StrokeDashOffset : 0.0;
             if (Math.Abs(from - to) < ArcEpsilon && !exit) return;
             // Normal clocks intentionally overlap the measured sample cadence.
@@ -1121,25 +1127,25 @@ namespace ScriptXVisual476 {
             if (hasReading) {
                 // The collector continued off-screen; resume the latest truth.
                 actual = target;
-                SnapArc(target);
+                SnapArc();
                 FadeRing(held ? 0.65 : 1.0);
                 number.Opacity = held ? 0.66 : 1.0;
                 PaintNumber();
             }
         }
 
-        public void SetSample(double fps) {
+        public void SetSample(double fps, double fraction) {
             if (disposed || !(fps > 0.0) || Double.IsNaN(fps) || Double.IsInfinity(fps)) return;
             bool first = !hasReading || exiting;
             bool resume = held || exiting;
-            if (first) actual = fps;
-            target = fps;
+            actual = target = fps;
+            targetOffset = DashLength * (1.0 - fraction);
             hasReading = true;
             held = false;
             exiting = false;
             if (!visible) return;
-            if (first) SnapArc(fps);
-            else AnimateArc(fps, false);
+            if (first) SnapArc();
+            else AnimateArc(false);
             if (first || resume) {
                 FadeRing(1.0);
                 number.Opacity = 1.0;
@@ -1151,9 +1157,6 @@ namespace ScriptXVisual476 {
             if (disposed || !hasReading || held || exiting) return;
             held = true;
             // Freezing the visual is not pretending to measure a new sample.
-            actual = (target < VisualScale * MinArc || target > VisualScale)
-                ? target : FpsForOffset(ring.StrokeDashOffset);
-            target = actual;
             StopArcClock();
             Unhook();
             if (visible) {
@@ -1172,7 +1175,9 @@ namespace ScriptXVisual476 {
             if (!visible) { Reset(); return; }
             FadeRing(1.0);
             number.Opacity = 1.0;
-            AnimateArc(0.0, true);
+            actual = 0.0;
+            PaintNumber();
+            AnimateArc(true);
         }
 
         public void Reset() {
@@ -1186,7 +1191,7 @@ namespace ScriptXVisual476 {
             framesSinceRate = 0;
             rateTick = 0;
             drawnLabel = null;
-            lastTextTick = previousRenderTick = 0;
+            previousRenderTick = 0;
             worstRenderGapMs = 0;
             ring.BeginAnimation(UIElement.OpacityProperty, null);
             ring.BeginAnimation(Shape.StrokeDashOffsetProperty, null);
@@ -1241,7 +1246,7 @@ namespace ScriptXVisual476 {
                 Unhook(); return;
             }
             // Keep the frequently animated ring under WPF's native clock.
-            // Reads only, and amortize expensive TextBlock layout changes.
+            // Layout changes only when the formatted sample changes.
             long now = Stopwatch.GetTimestamp();
             if (previousRenderTick != 0) {
                 double gapMs = (now - previousRenderTick) * 1000.0 / Stopwatch.Frequency;
@@ -1249,16 +1254,6 @@ namespace ScriptXVisual476 {
             }
             previousRenderTick = now;
             double currentOffset = ring.StrokeDashOffset;
-            double mapped = FpsForOffset(currentOffset);
-            // The ring saturates at 360 FPS and has a 6% visibility floor.
-            // Do not clamp the genuine label at either boundary.
-            actual = !exiting && (target < VisualScale * MinArc || target > VisualScale)
-                ? target : mapped;
-            if (lastTextTick == 0 || (now - lastTextTick) * 1000.0 / Stopwatch.Frequency >= TextIntervalMs) {
-                lastTextTick = now;
-                PaintNumber();
-            }
-
             if (rateTick == 0) rateTick = now;
             framesSinceRate++;
             double elapsed = (double)(now-rateTick) / Stopwatch.Frequency;
@@ -1268,7 +1263,7 @@ namespace ScriptXVisual476 {
                 rateTick = now;
             }
             // Exit's clock Completed callback owns clearing the idle state.
-            if (!exiting && Math.Abs(currentOffset - OffsetFor(target)) < ArcEpsilon)
+            if (!exiting && Math.Abs(currentOffset - targetOffset) < ArcEpsilon)
                 Unhook();
         }
 
@@ -1280,9 +1275,7 @@ namespace ScriptXVisual476 {
             // The visual return-to-zero is not a measured FPS sample.
             string text;
             if (exiting) {
-                text = actual < 1.0 ? String.Empty :
-                    Math.Round(actual, 0, MidpointRounding.AwayFromZero)
-                        .ToString("0", CultureInfo.CurrentCulture);
+                text = String.Empty;
             } else if (actual < 1.0) {
                 // Small *genuine* measurements keep modest precision.
                 text = actual.ToString("0.0#", CultureInfo.CurrentCulture);
@@ -1318,7 +1311,7 @@ namespace ScriptXVisual476 {
         ) | Select-Object -Unique
         Add-Type -TypeDefinition $fpsRendererSource -ReferencedAssemblies $fpsRendererRefs -ErrorAction Stop
     }
-    $script:FpsNativeGaugeReady = ('ScriptXVisual476.FluidFpsGauge' -as [type]) -ne $null
+    $script:FpsNativeGaugeReady = ('ScriptXVisual483.FluidFpsGauge' -as [type]) -ne $null
 }
 catch {
     Write-HsStartupLog ('FPS_VISUAL_RENDERER_FALLBACK: ' + ($_ | Out-String))
@@ -1339,12 +1332,18 @@ $script:FpsUiSeries = ''
 $script:FpsUiSequence = [long]-1
 $script:FpsUiSnapshot = $null
 $script:FpsUiLastMeasuredUtc = [datetime]::MinValue
-$script:FpsUiLastLowMeasuredUtc = [datetime]::MinValue
 $script:FpsUiMissingSinceUtc = [datetime]::MinValue
 # Two different windows: short measurement gaps must not blink the UI, whereas
 # a confirmed absence of the previous game must eventually release its data.
 $script:FpsUiStaleGraceMs = 3500.0
 $script:FpsUiTargetLostGraceMs = 8000.0
+# Linear through 240 FPS. Above this point a smooth tail leaves room for higher rates.
+# The number uses the measurement directly and is independent of arc geometry.
+function Get-FpsRingFraction([double]$Fps) {
+    if ($Fps -le 0) { return 0.0 }
+    if ($Fps -le 240.0) { return [math]::Max(0.06, $Fps / 360.0) }
+    return 1.0 - 40.0 / ($Fps - 120.0)
+}
 function Set-FpsLiveReading([double]$Value, [int]$GamePid) {
     if ($GamePid -le 0 -or $Value -le 0 -or [double]::IsNaN($Value) -or [double]::IsInfinity($Value)) { return }
     # Capture remains the authority. WPF animates the ring between genuine
@@ -1359,7 +1358,7 @@ function Set-FpsLiveReading([double]$Value, [int]$GamePid) {
     $script:FpsGaugeIsHeld = $false
     $script:FpsGaugeExiting = $false
     if ($null -ne $script:FpsFramePresenter) {
-        $script:FpsFramePresenter.SetSample($Value)
+        $script:FpsFramePresenter.SetSample($Value, (Get-FpsRingFraction $Value))
     }
     elseif ($ui.FpsLive.Opacity -ne 1.0) { $ui.FpsLive.Opacity = 1.0 }
 }
@@ -1367,7 +1366,6 @@ function Clear-FpsLiveReading {
     # Only clear when the game is actually gone/changed beyond the grace period.
     if ($null -ne $ui.FpsProcessBadge) { $ui.FpsProcessBadge.Opacity = 0.0 }
     if ($null -ne $ui.FpsProcessText) { $ui.FpsProcessText.Text = '' }
-    if ($null -ne $ui.FpsStatusText) { $ui.FpsStatusText.Text = '' }
     $script:FpsGaugeLatestReal = 0.0
     $script:FpsGaugeTargetValue = 0.0
     $script:FpsGaugeVisualValue = 0.0
@@ -1388,7 +1386,6 @@ function Start-FpsGaugeExitToZero {
     # A visually smooth shutdown, triggered only by confirmed game exit.
     if ($null -ne $ui.FpsProcessBadge) { $ui.FpsProcessBadge.Opacity = 0.0 }
     if ($null -ne $ui.FpsProcessText) { $ui.FpsProcessText.Text = '' }
-    if ($null -ne $ui.FpsStatusText) { $ui.FpsStatusText.Text = '' }
     # Never write interpolated values to the collector.
     if ($script:FpsGaugeExiting) { return }
     $script:FpsGaugeExiting = $true
@@ -1405,9 +1402,6 @@ function Start-FpsGaugeExitToZero {
 }
 function Suspend-FpsLiveReading {
     if ($script:FpsGaugeExiting) { return }
-    if ($null -ne $ui.FpsStatusText -and $ui.FpsStatusText.Text -ne 'Frame data paused') {
-        $ui.FpsStatusText.Text = 'Frame data paused'
-    }
     # A gap in measured presents is not a measured zero FPS. Keep the LAST
     # REAL sample, visually dimmed rather than blinking it off/on or claiming
     # a new live measurement. The ring NEVER animates through fake FPS samples.
@@ -1420,9 +1414,7 @@ function Suspend-FpsLiveReading {
         }
         return
     }
-    # Freeze the last displayed measured reading; no fabricated motion during
-    # a genuine absence of presents. A future measured frame can retarget it.
-    $script:FpsGaugeTargetValue = $script:FpsGaugeVisualValue
+    # Keep the last measured label and leave the fallback arc at its current position.
     $script:FpsGaugeVelocity = 0.0
     $script:FpsGaugeIsHeld = $script:FpsGaugeVisualValue -gt 0
     if ($script:FpsGaugeIsHeld -and $ui.FpsLive.Opacity -ne 0.66) {
@@ -1438,13 +1430,43 @@ function Reset-FpsStatistics {
         if ($ui[$name].Opacity -ne 1.0) { $ui[$name].Opacity = 1.0 }
     }
 }
+function Get-FpsCaptureCaption($Frame) {
+    if ($Frame.State -eq 'LIVE') {
+        if (-not $Frame.Foreground) { return ('Background · ' + $Frame.Source) }
+        return [string]$Frame.Source
+    }
+    switch ($Frame.CaptureStatus) {
+        'ETW_RESOURCE_LIMIT' { return 'ETW resources busy' }
+        'ETW_ACCESS_DENIED' { return 'ETW access denied' }
+        'ENGINE_DOWNLOADING' { return 'Downloading capture engine' }
+        'ENGINE_DOWNLOAD_FAILED' { return 'Capture download failed' }
+        'ENGINE_UNSUPPORTED' { return 'Capture engine unsupported' }
+        { $_ -in 'ETW_START_FAILED','ENGINE_START_ERROR','ENGINE_EXIT','READER_STOP_FAILED','CAPTURE_WORKER_ERROR' } { return 'Capture unavailable' }
+    }
+    if ($Frame.Evidence -eq 'CAPTURE_UNAVAILABLE' -and $Frame.CaptureStatus -eq 'RUNNING') { return 'Capture unavailable' }
+    switch ($Frame.State) {
+        'MULTIPLE_RENDERERS' { return 'Multiple renderers · select PID' }
+        'IDENTITY_UNAVAILABLE' { return 'Process identity unavailable' }
+        'TARGET_NOT_OBSERVED' { return 'Waiting for target PID' }
+        'WAITING_FOR_GAME' { return 'Focus the game' }
+        'NO_NEW_PRESENTS' { return 'Frame data paused' }
+        'STALE_SNAPSHOT' { return 'Frame data paused' }
+        'SAMPLER_ERROR' { return 'Capture unavailable' }
+        default { return 'Starting capture' }
+    }
+}
 function Update-RealGameFps {
-    if (-not $script:Fps433Ready) { Clear-FpsLiveReading; return }
-    $frame = [ScriptXFps472.Engine]::GetLatest()
+    if (-not $script:Fps433Ready) {
+        $ui.FpsStatusText.Text = 'Capture engine unavailable'
+        return
+    }
+    $frame = [ScriptXFps483.Engine]::GetLatest()
     $script:FpsUiSnapshot = $frame
     $now = [datetime]::UtcNow
     $isMeasured = ($frame.State -eq 'LIVE') -and ($frame.Fps -gt 0) -and ($frame.Pid -gt 0) -and (-not [string]::IsNullOrWhiteSpace([string]$frame.Identity))
 
+    $caption = Get-FpsCaptureCaption $frame
+    if ($ui.FpsStatusText.Text -cne $caption) { $ui.FpsStatusText.Text = $caption }
     if ($isMeasured) {
         $script:FpsUiMissingSinceUtc = [datetime]::MinValue
         # Reset ONLY on a different verified game identity. Do not reset on a
@@ -1456,7 +1478,6 @@ function Update-RealGameFps {
             $script:FpsUiSeries = ''
             $script:FpsUiSequence = [long]-1
             $script:FpsUiLastMeasuredUtc = [datetime]::MinValue
-            $script:FpsUiLastLowMeasuredUtc = [datetime]::MinValue
         }
         $series = '{0}/{1}/{2}' -f $frame.Identity, $frame.Source, $frame.Chain
         if ($series -cne $script:FpsUiSeries) {
@@ -1464,12 +1485,7 @@ function Update-RealGameFps {
             $script:FpsUiSequence = [long]-1
         }
         if ($script:FpsUiSequence -eq [long]$frame.Sequence) {
-            # A repeated sampler snapshot is not a new frame. Keep current UI
-            # untouched until a real sequence change, including stale dimming.
-            if ($script:FpsUiLastMeasuredUtc -ne [datetime]::MinValue -and
-                ($now - $script:FpsUiLastMeasuredUtc).TotalMilliseconds -ge $script:FpsUiStaleGraceMs) {
-                Suspend-FpsLiveReading
-            }
+            # GetLatest independently checks both producer and per-stream freshness.
             return
         }
         $script:FpsUiSequence = [long]$frame.Sequence
@@ -1482,10 +1498,9 @@ function Update-RealGameFps {
             if ($ui.FpsProcessText.Text -cne $gameName) { $ui.FpsProcessText.Text = $gameName }
             if ($ui.FpsProcessBadge.Opacity -ne 1.0) { $ui.FpsProcessBadge.Opacity = 1.0 }
         }
-        if ($ui.FpsStatusText.Text -cne 'Frame capture active') { $ui.FpsStatusText.Text = 'Frame capture active' }
+        $tip = '{0} · PID {1} · {2}' -f $frame.Game, $frame.Pid, $frame.Source
+        if ($ui.FpsStatusText.ToolTip -cne $tip) { $ui.FpsStatusText.ToolTip = $tip }
         foreach ($name in @('FpsAvg','FpsLow','FpsPeak','FpsFrame')) { $ui[$name].Opacity = 1.0 }
-        # RTSS has no per-frame distribution, so do not blank out a previously
-        # measured PresentMon 1% LOW during brief source handovers.
         if ($frame.Avg -gt 0) {
             $value = if ($frame.Avg -lt 1) { '{0:0.######}' -f $frame.Avg } else { '{0:0.0}' -f $frame.Avg }
             if ($ui.FpsAvg.Text -cne $value) { $ui.FpsAvg.Text = $value }
@@ -1493,13 +1508,8 @@ function Update-RealGameFps {
         if ($frame.Low -gt 0) {
             $value = if ($frame.Low -lt 1) { '{0:0.######}' -f $frame.Low } else { '{0:0.0}' -f $frame.Low }
             if ($ui.FpsLow.Text -cne $value) { $ui.FpsLow.Text = $value }
-            $script:FpsUiLastLowMeasuredUtc = $now
-        }
-        # An RTSS fallback cannot supply per-frame 1% lows. Debounce its
-        # staleness independently so rapid source handovers do not flash it.
-        if ($ui.FpsLow.Text -ne '—' -and $script:FpsUiLastLowMeasuredUtc -ne [datetime]::MinValue -and
-            ($now - $script:FpsUiLastLowMeasuredUtc).TotalMilliseconds -ge $script:FpsUiStaleGraceMs) {
-            $ui.FpsLow.Opacity = 0.66
+        } elseif ($ui.FpsLow.Text -ne '—') {
+            $ui.FpsLow.Text = '—'
         }
         if ($frame.Peak -gt 0) {
             $value = '{0:0.0}' -f $frame.Peak
@@ -1512,6 +1522,17 @@ function Update-RealGameFps {
         return
     }
 
+    $tip = $frame.CaptureStatus + ' / ' + $frame.RtssStatus + ' / ' + $frame.State
+    if ($ui.FpsStatusText.ToolTip -cne $tip) { $ui.FpsStatusText.ToolTip = $tip }
+    if ($frame.State -eq 'MULTIPLE_RENDERERS' -and $script:FpsUiIdentity) {
+        Clear-FpsLiveReading
+        Reset-FpsStatistics
+        $script:FpsUiIdentity = ''
+        $script:FpsUiVisualIdentity = ''
+        $script:FpsUiSeries = ''
+        $script:FpsUiSequence = [long]-1
+        $script:FpsUiLastMeasuredUtc = [datetime]::MinValue
+    }
     # Process-exit notifications from OS lifetime handles are authoritative.
     # Missing Present events or an Alt+Tab on their own never trigger this.
     if ($script:FpsUiIdentity -ne '' -and
@@ -1523,7 +1544,6 @@ function Update-RealGameFps {
         $script:FpsUiSeries = ''
         $script:FpsUiSequence = [long]-1
         $script:FpsUiLastMeasuredUtc = [datetime]::MinValue
-        $script:FpsUiLastLowMeasuredUtc = [datetime]::MinValue
         $script:FpsUiMissingSinceUtc = [datetime]::MinValue
         return
     }
@@ -1546,7 +1566,6 @@ function Update-RealGameFps {
                 $script:FpsUiSeries = ''
                 $script:FpsUiSequence = [long]-1
                 $script:FpsUiLastMeasuredUtc = [datetime]::MinValue
-                $script:FpsUiLastLowMeasuredUtc = [datetime]::MinValue
             }
             return
         }
@@ -1562,9 +1581,9 @@ function Write-FpsUiDiagnostic {
         $frame = $script:FpsUiSnapshot
         # Actual WPF dependency-property values (including the running visual animation), not a claim about screen pixels.
         $arcTarget = if ($null -ne $script:FpsFramePresenter) {
-            [double](43.93 * (1.0 - [math]::Max(0.0, [math]::Min(1.0, $script:FpsFramePresenter.LatestTarget / 360.0))))
+            [double](43.93 * (1.0 - (Get-FpsRingFraction $script:FpsFramePresenter.LatestTarget)))
         } else { [double](43.93 * (1.0 - $script:FpsGaugeLevel)) }
-        [ScriptXFps472.Engine]::RecordUi([string]$frame.Identity, [string]$frame.Source,
+        [ScriptXFps483.Engine]::RecordUi([string]$frame.Identity, [string]$frame.Source,
             [long]$frame.Sequence, [string]$frame.State, [double]$script:FpsGaugeLatestReal,
             [string]$ui.FpsLive.Text, [double]$arcTarget,
             [double]$ui.FpsRingProgress.StrokeDashOffset, [double]$ui.FpsRingProgress.Opacity)
@@ -1581,10 +1600,10 @@ if ($FpsProbe) {
     try {
         for ($sample = 0; $sample -lt $FpsProbeSeconds; $sample++) {
             Start-Sleep -Seconds 1
-            $frame = [ScriptXFps472.Engine]::GetLatest()
+            $frame = [ScriptXFps483.Engine]::GetLatest()
             Write-Output ('{0:HH:mm:ss} STATE={1} SOURCE={2} FPS={3:0.0} GAME={4} PID={5} AGE_MS={6:0} EVIDENCE={7} {8}' -f
                 (Get-Date), $frame.State, $frame.Source, $frame.Fps, $frame.Game, $frame.Pid,
-                $frame.FrameAgeMs, $frame.Evidence, [ScriptXFps472.Engine]::Diagnostic())
+                $frame.FrameAgeMs, $frame.Evidence, [ScriptXFps483.Engine]::Diagnostic())
         }
     } finally { Stop-Fps433Engine }
     return
@@ -2640,6 +2659,13 @@ $script:Config = @{
 
           <!-- Left-aligned badge: identity still comes from the active real game capture. -->
           <Grid Grid.Row="0" Margin="0,-7,0,0">
+           <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="Auto"/>
+            <ColumnDefinition Width="*"/>
+           </Grid.ColumnDefinitions>
+           <TextBlock x:Name="FpsStatusText" Grid.Column="1" Text="Starting capture"
+                      Foreground="#A1B4C3" FontSize="10" Margin="6,5,0,0"
+                      TextAlignment="Right" TextTrimming="CharacterEllipsis" VerticalAlignment="Top"/>
            <Border x:Name="FpsProcessBadge" HorizontalAlignment="Left"
                    MaxWidth="180" Opacity="0" CornerRadius="14" Padding="10,6"
                    BorderThickness="0.8" VerticalAlignment="Top" IsHitTestVisible="False">
@@ -2758,8 +2784,6 @@ $script:Config = @{
               </Style>
              </TextBlock.Style>
             </TextBlock>
-            <!-- Internal status is retained for telemetry logic, never drawn. -->
-            <TextBlock x:Name="FpsStatusText" Text="" Visibility="Collapsed"/>
            </StackPanel>
           </Grid>
 
@@ -3842,7 +3866,7 @@ foreach ($m in [regex]::Matches($markup.OuterXml, 'x:Name="([^"]+)"')) {
 $script:FpsFramePresenter = $null
 if ($script:FpsNativeGaugeReady) {
     try {
-        $script:FpsFramePresenter = [ScriptXVisual476.FluidFpsGauge]::new(
+        $script:FpsFramePresenter = [ScriptXVisual483.FluidFpsGauge]::new(
             $ui.FpsRingProgress, $null, $ui.FpsLive)
     }
     catch { Write-HsStartupLog ('FPS_VISUAL_INIT_FALLBACK: ' + ($_ | Out-String)) }
@@ -5646,7 +5670,7 @@ foreach ($navName in @('Boost','Latency','Network','Cleanup')) {
 Set-ScriptXPage -Name 'Home' 
 
 # FPS presentation only: capture runs in independent background workers.
-# The FPS numeral and arc are drawn from the SAME smoothed display value.
+# Only the arc interpolates between the measured values.
 # This is presentation interpolation, not a new measured FPS sample; statistics
 # and engine diagnostics continue to use only unmodified frame measurements.
 $script:FpsGaugePreviousValue = -1.0
@@ -5662,13 +5686,7 @@ function Update-FpsRingProgress {
         if ($null -eq $ring) { return }
 
         $fpsValue = [double]$script:FpsGaugeVisualValue
-        # Preserve the original gauge scale of 0..360 FPS. This is a fill
-        # ratio (0..100% of the arc), not an FPS percentage or fabricated data.
-        $level = if ($fpsValue -gt 0.0) {
-            if ($script:FpsGaugeExiting) {
-                [math]::Min(1.0, $fpsValue / 360.0)
-            } else { [math]::Max(0.06, [math]::Min(1.0, $fpsValue / 360.0)) }
-        } else { 0.0 }
+        $level = Get-FpsRingFraction $fpsValue
         $targetOpacity = if ($fpsValue -le 0.0) { 0.0 } elseif ($script:FpsGaugeIsHeld) { 0.65 } else { 1.0 }
         if ([math]::Abs($targetOpacity - $script:FpsGaugeShownOpacity) -ge 0.01) {
             $script:FpsGaugeShownOpacity = $targetOpacity
@@ -5744,15 +5762,11 @@ function Update-SmoothFpsGauge {
     # A real capture gap holds the last measured value without inventing FPS.
     # Only the display *between* genuine samples is interpolated.
     if ($display -gt 0.0 -or $script:FpsGaugeExiting) {
-        $label = if ($script:FpsGaugeExiting) {
-            if ($display -lt 1.0) { '' } else { '{0:0}' -f $display }
-        } elseif ($display -lt 1.0) {
-            '{0:0.0#}' -f $display
-        } elseif ($display -lt 10.0) {
-            '{0:0.0}' -f $display
-        } else {
-            '{0:0}' -f $display
-        }
+        $reading = $script:FpsGaugeTargetValue
+        $label = if ($script:FpsGaugeExiting) { '' }
+            elseif ($reading -lt 1.0) { '{0:0.0#}' -f $reading }
+            elseif ($reading -lt 10.0) { '{0:0.0}' -f $reading }
+            else { '{0:0}' -f $reading }
         if ($ui.FpsLive.Text -cne $label) { $ui.FpsLive.Text = $label }
     }
     Update-FpsRingProgress
