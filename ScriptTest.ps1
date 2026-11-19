@@ -4178,6 +4178,7 @@ function Update-SystemHealth($result, [switch]$Immediate) {
     if ($age -lt 0 -or $age -gt 15) {Reset-SystemHealth 'STALE DATA'; return}
     $c=$result.Categories
     $lines=@("Estimated operating health · $($result.Timestamp.ToLocalTime().ToString('HH:mm:ss'))",
+        "Estimated operational risk: thermal 30%, memory 20%, storage 30%, WHEA 20%; severity-based. Missing checks never count as healthy. Incomplete evidence limits the display to 95% (confidence cap), not diagnosed damage.",
         "Scored domains: $($result.DataCoverage) · complete: $($result.CompleteDomains)/4 · confidence: $($result.Confidence)")
     foreach ($domain in $c.Values) {
         $sampleTime=if ($domain.Timestamp -and $domain.Timestamp -gt [datetime]::MinValue) {
@@ -4188,7 +4189,17 @@ function Update-SystemHealth($result, [switch]$Immediate) {
     $ui.HealthState.ToolTip=$lines -join [environment]::NewLine
     $ui.HealthOne.ToolTip = @($c.Thermal.Reason,$c.Thermal.Observations) -join [environment]::NewLine
     $ui.HealthTwo.ToolTip = $c.Memory.Reason
-    $ui.HealthThree.ToolTip = "$($c.Storage.Reason) / $($c.WHEA.Reason)"
+    $diskInfo=@("$($c.Storage.Reason) / $($c.WHEA.Reason)")
+    foreach ($row in $c.Storage.Details) {
+        if ($row.Reliability) {
+            $values=@(foreach ($field in @('ReadErrorsUncorrected','WriteErrorsUncorrected')) {
+                $val=$row.Reliability.$field
+                if ($null -ne $val) {"$field=$val"}
+            })
+            if ($values.Count) {$diskInfo+="$($row.Name) · cumulative: $($values -join ', ')"}
+        }
+    }
+    $ui.HealthThree.ToolTip=$diskInfo -join [environment]::NewLine
     $visibleTemps=@()
     if ($c.Thermal.Status -in @('Available','Warning','Critical')) {
         foreach ($type in @('CPU Package','GPU Core')) {
@@ -4199,6 +4210,10 @@ function Update-SystemHealth($result, [switch]$Immediate) {
             if ($null -eq $peak) {$visibleTemps+=('{0} —' -f $type.Substring(0,3))}
             else {$visibleTemps+=('{0} {1:0}°' -f $type.Substring(0,3),$peak)}
         }
+    }
+    if (-not $visibleTemps.Count -and $c.Thermal.Status -eq 'Unavailable') {
+        $hot=$c.Thermal.Details | Where-Object Kind -eq 'GPU Hotspot' | Sort-Object Value -Descending | Select-Object -First 1
+        if ($hot) {$visibleTemps+=('Hotspot {0:0}°' -f $hot.Value)}
     }
     $ui.HealthOne.Text = if ($visibleTemps.Count) {$visibleTemps -join ' / '} else {"Temp · $($c.Thermal.Status)"}
     $ui.HealthTwo.Text = if ($c.Memory.Pressure -eq 'Normal' -and $null -ne $c.Memory.Details.Commit) {
@@ -4212,10 +4227,11 @@ function Update-SystemHealth($result, [switch]$Immediate) {
     }
     $ui.HealthThree.Text = "Disk $diskLabel · HW $hwLabel"
     $label=$result.Status
-    if ($null -ne $result.Score -and $result.Confidence -ne 'High') {$label+=' (EST.)'}
+    if ($result.Confidence -ne 'High' -and $null -ne $result.Score) {$label+=" · EST $($result.DataCoverage)"}
+    if ($result.Status -eq 'INSUFFICIENT DATA') {$label="DATA $($result.DataCoverage)"}
     $ui.HealthState.Text=$label
     $color=switch ($result.Status) {
-        ATTENTION {'#F58282'} CHECK {'#F5BD68'} 'INSUFFICIENT DATA' {'#9FB4C5'} default {'#39D6A4'}
+        ATTENTION {'#F58282'} CHECK {'#F5BD68'} 'INSUFFICIENT DATA' {'#9FB4C5'} OBSERVING {'#9FB4C5'} default {'#39D6A4'}
     }
     $ui.HealthState.Foreground=$color
     $ui.HealthArc.Stroke=$ui.HealthState.Foreground
@@ -4464,13 +4480,6 @@ function Show-Reading($d) {
         $ui.Uptime.Text = 'N/A'
     }
 
-    if ($null -ne $d.HealthV2) {
-        $script:LastHealthResult=$d.HealthV2
-        if ($ui.HomePage.IsVisible -and $window.WindowState -ne [Windows.WindowState]::Minimized) {
-            Update-SystemHealth $d.HealthV2
-        }
-    }
-
     Show-Disks $d.Disks
 
     Show-NetworkReading $d.Network
@@ -4621,6 +4630,40 @@ function Invoke-NvidiaQuery {
     }
 }
 
+function ConvertTo-HealthChannels($sensors,$hardware,$prefix,$source,$sampleAt) {
+    $owners=@{}
+    foreach ($hw in $hardware) {if ($hw.Identifier) {$owners[[string]$hw.Identifier]=$hw}}
+    foreach ($channel in $sensors) {
+        $parent=[string]$channel.Parent
+        if (-not $parent -or -not $owners.ContainsKey($parent) -or $channel.SensorType -ne 'Temperature' -or
+            -not ([string]$channel.Identifier).StartsWith($parent+'/')) {continue}
+        $hw=$owners[$parent]
+        $kind=if ($hw.HardwareType -match '^(Cpu)$' -and $parent -match '^/(intelcpu|amdcpu)/') {
+            if ($channel.Name -match '(?i)distance to (tj\.?\s*max|tjmax)') {'CPU Margin'}
+            elseif ($channel.Name -match '(?i)package|tctl|tdie|cpu die') {'CPU Package'}
+        } elseif ($hw.HardwareType -match '^Gpu(Nvidia|Amd|Ati|Intel)$') {
+            if ($channel.Name -match '(?i)^GPU (hot\s*spot|junction)( temperature)?$') {'GPU Hotspot'}
+            elseif ($channel.Name -match '(?i)^GPU Core$') {'GPU Core'}
+        }
+        if (-not $kind) {continue}
+        $v=Convert-Number $channel.Value
+        if ($null -eq $v) {continue}
+        $sample=New-ThermalSample ("${prefix}:$parent") $kind $v $source $sampleAt
+        $sample.Id=$prefix+':'+[string]$channel.Identifier
+        $sample
+    }
+}
+
+function Read-OptionalHealthSensors($now) {
+    $namespace='root/OpenHardwareMonitor'
+    $channels=@(Get-CimInstance -Namespace $namespace -ClassName Sensor -Filter "SensorType='Temperature'" -OperationTimeoutSec 2 -ErrorAction Stop)
+    if (-not $channels.Count) {throw 'No Open Hardware Monitor temperatures published'}
+    $devices=@(Get-CimInstance -Namespace $namespace -ClassName Hardware -OperationTimeoutSec 2 -ErrorAction Stop)
+    $samples=@(ConvertTo-HealthChannels $channels $devices 'ohm' 'OpenHardwareMonitor' $now)
+    if (-not $samples.Count) {throw 'No identified Open Hardware Monitor CPU/GPU temperatures'}
+    $samples
+}
+
 function Get-SensorData([bool]$IncludeHealth) {
     $sensors = @(Get-CimSafe Sensor '' 'root/LibreHardwareMonitor')
     $hardware = @()
@@ -4691,28 +4734,7 @@ function Get-SensorData([bool]$IncludeHealth) {
 
     $healthSensors=@()
     if ($IncludeHealth) {
-        $sampleAt=[datetime]::UtcNow
-        $owners=@{}
-        foreach ($hw in $hardware) {if ($hw.Identifier) {$owners[[string]$hw.Identifier]=$hw}}
-        foreach ($channel in $sensors) {
-            $parent=[string]$channel.Parent
-            if (-not $parent -or -not $owners.ContainsKey($parent) -or $channel.SensorType -ne 'Temperature' -or
-                -not ([string]$channel.Identifier).StartsWith($parent+'/')) {continue}
-            $hw=$owners[$parent]
-            $kind=if ($hw.HardwareType -match '^(Cpu)$' -and $parent -match '^/(intelcpu|amdcpu)/') {
-                if ($channel.Name -match '(?i)distance to (tj\.?\s*max|tjmax)') {'CPU Margin'}
-                elseif ($channel.Name -match '(?i)package|tctl|tdie|cpu die') {'CPU Package'}
-            } elseif ($hw.HardwareType -match '^Gpu(Nvidia|Amd|Intel)$') {
-                if ($channel.Name -match '(?i)^GPU (hot\s*spot|junction)( temperature)?$') {'GPU Hotspot'}
-                elseif ($channel.Name -match '(?i)^GPU Core$') {'GPU Core'}
-            }
-            if (-not $kind) {continue}
-            $v=Convert-Number $channel.Value
-            if ($null -eq $v) {continue}
-            $sample=New-ThermalSample "lhm:$parent" $kind $v 'LibreHardwareMonitor' $sampleAt
-            $sample.Id=[string]$channel.Identifier
-            $healthSensors+=$sample
-        }
+        $healthSensors=@(ConvertTo-HealthChannels $sensors $hardware 'lhm' 'LibreHardwareMonitor' ([datetime]::UtcNow))
     }
 
     [pscustomobject]@{
@@ -4874,15 +4896,17 @@ function Get-NetworkReading {
 
 # Domain units are observable checks, not failure probabilities.
 function New-Condition($name, $status, $reason, $at, $complete = $true) {
-    [pscustomobject]@{Name=$name; Status=$status; Reason=$reason; Timestamp=$at; Complete=$complete; Details=$null; Observations=$null; Pressure=$null}
+    [pscustomobject]@{Name=$name; Status=$status; Reason=$reason; Timestamp=$at; Complete=$complete; Details=$null; Observations=$null; Pressure=$null; Pending=$false; LastKnownStatus=$null}
 }
 
 function Get-ConfirmedLevel($history, $key, [int]$raw, $at, $gap, $seconds) {
     $h = $history[$key]
     if (-not $h -or $at -lt $h.At -or ($at-$h.At).TotalSeconds -gt $gap) {
+        # A gap invalidates a pending trend. A confirmed alarm needs fresh recovery samples.
+        $prior=if ($h) {[int]$h.Level} else {0}
         $h = @{ At=$at; Candidate=$raw; Count=0; Level=0; Bands=@(
-            @{ Above=$false; Since=$at; Count=0; Confirmed=$false }
-            @{ Above=$false; Since=$at; Count=0; Confirmed=$false }
+            @{ Above=$false; Since=$at; Count=0; Confirmed=($prior -ge 1) }
+            @{ Above=$false; Since=$at; Count=0; Confirmed=($prior -ge 2) }
         ) }
         $history[$key]=$h
     } elseif ($at -eq $h.At) { return $h.Level }
@@ -4906,14 +4930,15 @@ function Get-ConfirmedLevel($history, $key, [int]$raw, $at, $gap, $seconds) {
 
 function Get-ThermalConditionScore($samples, $history, $at, $expectedGpus, $expectedCpus) {
     $worst=0; $cpu=@{}; $gpu=@{}; $scorable=0; $qualified=$true; $generic=$false
-    $reasons=@(); $observations=@()
+    $reasons=@(); $observations=@(); $pending=$false; $missingAlarm=$false
     $margins=@{}
     foreach ($s in $samples) {
-        if ($s.Kind -eq 'CPU Margin' -and $null -ne $s.Value -and $s.Value -ge -30 -and $s.Value -le 160) {$margins[$s.Device]=$true}
+        if ($s.Kind -eq 'CPU Margin' -and $s.At -and $s.At -le $at -and ($at-$s.At).TotalSeconds -le $s.Gap -and $null -ne $s.Value -and $s.Value -ge -30 -and $s.Value -le 160) {$margins[$s.Device]=$true}
     }
     $active=@{}
     foreach ($s in $samples) {
         if (-not $s.Id -or $s.Kind -notin @('CPU Package','GPU Core','GPU Hotspot','CPU Margin','GPU Throttle')) { continue }
+        if (-not $s.At -or $s.At -gt $at -or ($at-$s.At).TotalSeconds -gt $s.Gap) {continue}
         if ($null -eq $s.Value -or [double]::IsNaN($s.Value) -or $s.Value -lt -30 -or $s.Value -gt 160) { continue }
         $raw=0
         if ($s.Kind -eq 'CPU Margin') {
@@ -4930,7 +4955,7 @@ function Get-ThermalConditionScore($samples, $history, $at, $expectedGpus, $expe
             $observations += "$($s.Id) hotspot $($s.Value) C (limit unknown)"
             continue
         } else {
-            $caution = if ($s.Kind -eq 'CPU Package') {90} else {85}
+            $caution = if ($s.Kind -eq 'CPU Package') {95} else {90}
             $raw = [int]($s.Value -ge $caution)
             $qualified=$false; $generic=$true
         }
@@ -4940,23 +4965,43 @@ function Get-ThermalConditionScore($samples, $history, $at, $expectedGpus, $expe
         $level=Get-ConfirmedLevel $history $s.Id $raw $s.At $s.Gap $s.Hold
         $observations += "$($s.Device) $($s.Kind)=$($s.Value) [$($s.Source)]"
         if ($history[$s.Id].Count -lt 3 -or $raw -ne $level) {$qualified=$false}
+        if ($raw -gt $level) {$pending=$true}
         if ($level) { $reasons += "$($s.Id): sustained thermal indication ($level)" }
         $worst=[math]::Max($worst,$level)
     }
     foreach ($key in @($history.Keys)) {
-        if ($key -ne 'Memory' -and -not $active.ContainsKey($key)) {$history.Remove($key)}
+        if ($key -eq 'Memory' -or $active.ContainsKey($key)) {continue}
+        if ($history[$key].Level -gt 0) {
+            $missingAlarm=$true
+            $reasons += "$key last reported a thermal alarm; waiting for a fresh reading"
+        } else {$history.Remove($key)}
     }
     $status=if (-not $scorable) {'Unavailable'} elseif ($worst -eq 2) {'Critical'} elseif ($worst) {'Warning'} else {'Available'}
-    $reason=if ($reasons.Count) {$reasons -join '; '} elseif ($scorable) {'No sustained thermal indication in measured channels'} else {'No identified thermal channel'}
+    $reason=if ($reasons.Count) {$reasons -join '; '} elseif ($scorable) {'No sustained thermal indication in measured channels'} elseif ($observations.Count) {'Temperature observed; no applicable limit'} else {'No identified thermal channel'}
     if ($generic) {$reason+='; generic caution only where device limit is unknown'}
     $d=New-Condition Thermal $status $reason $at ($qualified -and $cpu.Count -ge [math]::Max(1,$expectedCpus) -and $gpu.Count -ge $expectedGpus)
-    $d.Details=@($samples); $d.Observations=$observations -join '; '
+    if ($missingAlarm) {
+        $d.Complete=$false; $d.LastKnownStatus='Warning'
+        if ($worst -eq 0) {$d.Status='Stale'}
+    }
+    $d.Pending=$pending
+    if ($pending) {$d.Reason+='; elevated reading awaiting confirmation'}
+    $d.Details=@($samples | Where-Object { $_.At -and $_.At -le $at -and ($at-$_.At).TotalSeconds -le $_.Gap })
+    $d.Observations=$observations -join '; ' 
     $d
 }
 
 function Get-MemoryCondition($sample,$history,$at) {
     if (-not $sample -or $null -eq $sample.Commit -or $null -eq $sample.Available -or $sample.Total -le 0) {
         return (New-Condition Memory Unavailable 'Commit or physical headroom unavailable' $null $false)
+    }
+    foreach ($v in @($sample.Commit,$sample.Total,$sample.Available)) {
+        if ([double]::IsNaN($v) -or [double]::IsInfinity($v) -or $v -lt 0) {
+            return (New-Condition Memory Unavailable 'Invalid memory counters' $sample.At $false)
+        }
+    }
+    if ($sample.Available -gt $sample.Total -or $sample.Commit -gt 100) {
+        return (New-Condition Memory Unavailable 'Inconsistent memory counters' $sample.At $false)
     }
     $free=100.0*$sample.Available/$sample.Total
     $commit=$sample.Commit
@@ -4972,16 +5017,56 @@ function Get-MemoryCondition($sample,$history,$at) {
     $d=New-Condition Memory $status ("{0}: {1:N0}% commit, {2:N1}% physical available" -f $state,$commit,$free) $sample.At
     $d.Complete=($history.Memory.Count -ge 3 -and $level -eq $raw)
     $d.Details=$sample
+    if ($sample.Source) {$d.Reason+=" [$($sample.Source)]"}
+    $d.Pending=$raw -gt $level
     $d.Pressure=$state
     $d
 }
 
-function Get-StorageHealthSummary($disks,$counters,$at) {
+# Conservative reliability evidence: a reported uncorrectable error or worn-out
+# drive is a warning; it does not mean confirmed physical failure. The provider's
+# own Unhealthy/Non-Recoverable Error classification remains authoritative.
+function Apply-StorageReliabilityEvidence($summary,$row,$counter) {
+    if (-not $summary -or -not $row -or -not $counter) { return }
+    $risk=@()
+    foreach ($name in @('ReadErrorsUncorrected','WriteErrorsUncorrected')) {
+        $value=$counter.$name
+        if ($null -ne $value) {
+            $number=0.0
+            if ([double]::TryParse([string]$value,[ref]$number) -and $number -gt 0) {
+                # A cumulative counter can be historical: warn, never call it fatal.
+                $risk+=("$name=$number (cumulative)")
+            }
+        }
+    }
+    $wear=0.0
+    if ($null -ne $counter.Wear -and [double]::TryParse([string]$counter.Wear,[ref]$wear) -and
+        $wear -ge 95 -and $wear -le 100) {
+        $risk+=("device-reported wear {0:N0}%" -f $wear)
+    }
+    $temperature=0.0; $maximum=0.0
+    if ($null -ne $counter.Temperature -and $null -ne $counter.TemperatureMax -and
+        [double]::TryParse([string]$counter.Temperature,[ref]$temperature) -and
+        [double]::TryParse([string]$counter.TemperatureMax,[ref]$maximum) -and
+        $maximum -ge 30 -and $maximum -le 110 -and $temperature -ge $maximum -and $temperature -le 125) {
+        $risk+=("drive temperature {0:N0}C at/above reported {1:N0}C limit" -f $temperature,$maximum)
+    }
+    if (-not $risk.Count) {return}
+    if ($row.State -eq 'Healthy') {$row.State='Warning'}
+    if ($summary.Status -notin @('Critical','Stale')) {$summary.Status='Warning'}
+    $summary.Reason+=("; {0}: {1}" -f $row.Name,($risk -join ', '))
+}
+
+function Get-StorageHealthSummary($disks,$counters,$at,$reliabilityCache) {
     $ids=@{}; $rel=@{}; $items=@()
-    foreach ($d in $disks) { $ids[[string]$d.DeviceId]++ }
+    foreach ($d in $disks) {
+        $key=[string]$d.DeviceId
+        if ($key) {$ids[$key]=1+[int]$ids[$key]}
+    }
     foreach ($r in $counters) {
         $k=[string]$r.DeviceId
-        if ($rel.ContainsKey($k)) { $rel[$k]=$null } else { $rel[$k]=$r }
+        if (-not $k) {continue}
+        if ($rel.ContainsKey($k)) {$rel[$k]=$null} else {$rel[$k]=$r}
     }
     foreach ($d in $disks) {
         $health=[string]$d.HealthStatus
@@ -4990,26 +5075,48 @@ function Get-StorageHealthSummary($disks,$counters,$at) {
             $health=[string]$d.CimInstanceProperties['HealthStatus'].Value
             $opCodes=$d.CimInstanceProperties['OperationalStatus'].Value
         }
-        $ops=@($opCodes | Where-Object { $null -ne $_ } | ForEach-Object { [int]$_ })
-        # DMTF OperationalStatus: Error, Non-Recoverable Error, Predictive Failure.
-        $bad=@($ops | Where-Object { $_ -eq 7 }).Count
-        $warn=@($ops | Where-Object { $_ -in @(3,4,5,6,12,13,16) }).Count
+        $codes=@{'OK'=2;'Degraded'=3;'Stressed'=4;'Predictive Failure'=5;'Error'=6;
+            'Non-Recoverable Error'=7;'No Contact'=12;'Lost Communication'=13;'Dormant'=15;'Supporting Entity in Error'=16}
+        $ops=@(foreach ($op in $opCodes) {
+            $v=0
+            if ([int]::TryParse([string]$op,[ref]$v)) {$v}
+            elseif ($null -ne $op -and $codes.ContainsKey([string]$op)) {$codes[[string]$op]}
+            else {-1}
+        })
+        # DMTF codes 6 (Error) and 7 (Non-Recoverable Error) require attention;
+        # code 5 is predictive failure (warning), not a confirmed fatal failure.
+        $bad=@($ops | Where-Object { $_ -in @(6,7) }).Count
+        $warn=@($ops | Where-Object { $_ -in @(3,4,5,12,13,16) }).Count
+        $other=@($ops | Where-Object { $_ -notin @(2,3,4,5,6,7,12,13,15,16) }).Count
         $operOk=$ops.Count -gt 0 -and @($ops | Where-Object { $_ -notin @(2,15) }).Count -eq 0
         $state=if ($health -in @('2','Unhealthy') -or $bad) {'Unhealthy'}
                elseif ($health -in @('1','Warning') -or $warn) {'Warning'}
-               elseif ($health -in @('0','Healthy') -and $operOk) {'Healthy'} else {'Unknown'}
-        $counter=if ([string]$d.DeviceId -ne '' -and $ids[[string]$d.DeviceId] -eq 1) {$rel[[string]$d.DeviceId]}
-        $items += [pscustomobject]@{Id=$d.ObjectId; DeviceId=$d.DeviceId; Name=$d.FriendlyName; Bus=$d.BusType
-            HealthStatus=$health; OperationalStatus=$ops; State=$state; Reliability=$(if ($counter) {
-                [pscustomobject]@{Temperature=$counter.Temperature; Wear=$counter.Wear; ReadErrorsUncorrected=$counter.ReadErrorsUncorrected; WriteErrorsUncorrected=$counter.WriteErrorsUncorrected}
-            })}
+               elseif ($health -in @('0','Healthy') -and -not $other -and ($operOk -or -not $ops.Count)) {'Healthy'}
+               else {'Unknown'}
+        $id=[string]$d.ObjectId
+        $counter=$null
+        if ($id -and $reliabilityCache -and $reliabilityCache.ContainsKey($id)) {
+            $cached=$reliabilityCache[$id]
+            if ($cached -and $cached.At -and $at -ge $cached.At -and ($at-$cached.At).TotalMinutes -le 10) {$counter=$cached}
+        }
+        if (-not $counter -and [string]$d.DeviceId -and $ids[[string]$d.DeviceId] -eq 1) {
+            $counter=$rel[[string]$d.DeviceId]
+        }
+        $items += [pscustomobject]@{Id=$id;DeviceId=$d.DeviceId;Name=$d.FriendlyName;Bus=$d.BusType
+            HealthStatus=$health;OperationalStatus=$ops;State=$state;Reliability=$counter}
     }
-    $known=@($items | Where-Object State -ne Unknown).Count
     $states=@($items | ForEach-Object State)
-    $status=if ('Unhealthy' -in $states) {'Critical'} elseif ('Warning' -in $states) {'Warning'} elseif ($known) {'Available'} else {'Unavailable'}
-    $reason=if ($items.Count) { ($items | ForEach-Object {"$($_.Name) [$($_.DeviceId)] $($_.State)"}) -join '; ' } else {'No physical disks reported'}
-    $d=New-Condition Storage $status $reason $at ($known -gt 0 -and $known -eq $items.Count)
-    $d.Details=$items; $d
+    $known=@($items | Where-Object State -ne Unknown).Count
+    $status=if ('Unhealthy' -in $states) {'Critical'} elseif ('Warning' -in $states) {'Warning'}
+            elseif ($known) {'Available'} else {'Unavailable'}
+    $reason=if ($items.Count) {($items | ForEach-Object {"$($_.Name) [$($_.DeviceId)] $($_.State)"}) -join '; '}
+            else {'No physical disks reported'}
+    $result=New-Condition Storage $status $reason $at ($known -gt 0 -and $known -eq $items.Count)
+    $result.Details=$items
+    foreach ($row in $items) {
+        if ($row.Reliability) {Apply-StorageReliabilityEvidence $result $row $row.Reliability}
+    }
+    $result
 }
 
 function Get-WheaClassification($eventId,$level,$raw,$message) {
@@ -5025,14 +5132,23 @@ function Get-WheaClassification($eventId,$level,$raw,$message) {
             }
         }
     }
-    if ($level -in @(1,2) -and $message -match '(?i)\bfatal hardware error\b') {return 'Fatal'}
-    if ($level -in @(1,2) -and $message -match '(?i)\buncorrect(ed|able)\b') {return 'Uncorrected'}
-    if ($level -in @(3,4) -and $message -match '(?i)\bcorrected hardware error\b') {return 'Corrected'}
+    if ($level -in @(1,2) -and $message -match '(?im)^\s*(?:a |an )?fatal hardware error (?:has occurred|occurred|was reported)\b') {return 'Fatal'}
+    if ($level -in @(1,2) -and $message -match '(?im)^\s*(?:a |an )?uncorrect(?:ed|able) hardware error (?:has occurred|occurred|was reported)\b') {return 'Uncorrected'}
+    if ($level -in @(3,4) -and $message -match '(?im)^\s*(?:a |an )?corrected hardware error (?:has occurred|occurred|was reported)\b') {return 'Corrected'}
     'Unclassified'
 }
 
 function Get-WheaCondition($events,$at,$backlog) {
-    $events=@($events | Where-Object { $_ -and $_.Time -ge $at.AddHours(-1) })
+    $seen=@{}
+    $events=@(foreach ($entry in $events) {
+        if (-not $entry -or $entry.Time -lt $at.AddHours(-1) -or $entry.Time -gt $at) {continue}
+        if ($null -ne $entry.RecordId) {
+            $id=('{0}/{1}' -f $entry.RecordId,$entry.Time.Ticks)
+            if ($seen.ContainsKey($id)) {continue}
+            $seen[$id]=$true
+        }
+        $entry
+    })
     $critical=@($events | Where-Object { $_.Class -in @('Fatal','Uncorrected') }).Count
     $corrected=@($events | Where-Object Class -eq Corrected).Count
     $unknown=@($events | Where-Object Class -eq Unclassified).Count
@@ -5043,33 +5159,64 @@ function Get-WheaCondition($events,$at,$backlog) {
     $d.Details=$events; $d
 }
 
+# V3: severity-weighted operational risk, NOT a hardware lifetime percentage.
+# Missing evidence cannot count as healthy. Severe disk/WHEA faults cannot be
+# hidden by healthy readings from other domains. We retain the existing 0-100 UI.
 function Get-OperatingEstimate($thermal,$memory,$storage,$whea,$at) {
     $categories=[ordered]@{Thermal=$thermal;Memory=$memory;Storage=$storage;WHEA=$whea}
-    $known=0; $passed=0; $complete=0; $fatal=$false; $attention=$false; $warning=$false; $reasons=@()
-    foreach ($c in $categories.Values) {
-        if ($c.Status -in @('Available','Warning','Critical')) {
-            $known++
-            if ($c.Complete) {$complete++}
-            if ($c.Status -eq 'Available') {$passed+=2}
-            elseif ($c.Status -eq 'Warning') {$passed++; $warning=$true}
-            else { $attention=$true; if ($c.Name -in @('Storage','WHEA')) { $fatal=$true } }
-        }
+    $weights=@{Thermal=0.30;Memory=0.20;Storage=0.30;WHEA=0.20}
+    $warningRisk=@{Thermal=22;Memory=18;Storage=38;WHEA=32}
+    $criticalRisk=@{Thermal=75;Memory=65;Storage=100;WHEA=100}
+    $known=0; $complete=0; $risk=0.0; $attention=$false; $warning=$false
+    $criticalStorage=$false; $criticalThermal=$false; $criticalMemory=$false
+    $pending=$false; $unresolved=$false; $reasons=@()
+    $includedWeight=0.0
+    foreach ($name in $categories.Keys) {
+        $c=$categories[$name]
+        if (-not $c) {continue}
         $reasons += "$($c.Name): $($c.Reason)"
-    }
-    $unresolved=$false
-    foreach ($c in $categories.Values) {
-        if ($c.Status -eq 'Stale' -and $c.Details.Status -in @('Critical','Warning')) {$unresolved=$true}
+        if ($c.LastKnownStatus -in @('Critical','Warning') -or
+            ($c.Status -eq 'Stale' -and $c.Details.Status -in @('Critical','Warning'))) {$unresolved=$true}
+        if ($c.Pending) {$pending=$true}
+        if ($c.Status -notin @('Available','Warning','Critical')) {continue}
+        $known++
+        if ($c.Complete) {$complete++}
+        $weight=[double]$weights[$name]
+        $includedWeight+=$weight
+        if ($c.Status -eq 'Warning') {
+            $risk += $weight*[double]$warningRisk[$name]
+            $warning=$true
+        } elseif ($c.Status -eq 'Critical') {
+            $risk += $weight*[double]$criticalRisk[$name]
+            $attention=$true
+            if ($name -in @('Storage','WHEA')) {$criticalStorage=$true}
+            elseif ($name -eq 'Thermal') {$criticalThermal=$true}
+            elseif ($name -eq 'Memory') {$criticalMemory=$true}
+        }
     }
     $score=$null
-    if ($known -ge 3 -and -not $unresolved) {
-        $score=[int][math]::Round(100*$passed/(2*$known))
-        if ($fatal) {$score=[math]::Min($score,49)}
+    # The two physically relevant domains (storage and WHEA) must not both be absent.
+    $hardwareEvidence=$storage.Status -in @('Available','Warning','Critical') -or
+        $whea.Status -in @('Available','Warning','Critical')
+    if ($known -ge 3 -and $hardwareEvidence -and $includedWeight -gt 0 -and -not $unresolved) {
+        # Renormalize only among known domains; signal coverage remains separate.
+        $score=[int][math]::Round(100.0-$risk/$includedWeight)
+        if ($warning) {$score=[math]::Min($score,89)}
+        if ($criticalMemory) {$score=[math]::Min($score,59)}
+        if ($criticalThermal) {$score=[math]::Min($score,49)}
+        if ($criticalStorage) {$score=[math]::Min($score,35)}
+        # A limited evidence set is deliberately not advertised as perfect health.
+        # This is a confidence ceiling, not a diagnosed hardware defect.
+        if ($complete -lt 4 -or $pending) {$score=[math]::Min($score,95)}
+        $score=[int][math]::Max(0,[math]::Min(100,$score))
     }
-    $status=if ($attention) {'ATTENTION'} elseif ($warning -or $unresolved) {'CHECK'} elseif ($null -eq $score) {'INSUFFICIENT DATA'}
+    $status=if ($attention) {'ATTENTION'} elseif ($warning -or $unresolved) {'CHECK'}
+            elseif ($pending) {'OBSERVING'} elseif ($null -eq $score) {'INSUFFICIENT DATA'}
             elseif ($complete -eq 4) {'EXCELLENT'} else {'GOOD'}
+    $confidence=if ($null -eq $score) {'Low'} elseif ($complete -eq 4 -and -not $pending) {'High'} else {'Limited'}
     [pscustomobject]@{Score=$score;Status=$status;Reasons=$reasons;Timestamp=$at;DataCoverage="$known/4";CompleteDomains=$complete
-        Confidence=$(if ($known -lt 3) {'Low'} elseif ($complete -eq 4) {'High'} else {'Limited'})
-        Critical=$attention;LastQueryMs=$null;Categories=$categories;HardwareHealth=@($storage,$whea);OperatingCondition=@($thermal,$memory)}
+        Confidence=$confidence;Critical=$attention;LastQueryMs=$null;Categories=$categories
+        HardwareHealth=@($storage,$whea);OperatingCondition=@($thermal,$memory)}
 }
 
 function Read-LogAnchor($filter,[bool]$newest=$true) {
@@ -5089,12 +5236,24 @@ function Read-HealthWhea($cache,$now) {
         try { $cache.ProviderChecked=($meta.Name -eq $provider) } finally {$meta.Dispose()}
     }
     $head=Read-LogAnchor '*'
-    $oldest=Read-LogAnchor '*' $false
+    # The oldest System-log entry changes slowly. Cache this expensive reverse
+    # scan for ten minutes, but invalidate it when the log rolls over/clears.
+    $oldest=$cache.Oldest
+    if (-not $cache.OldestAt -or ($now-$cache.OldestAt).TotalMinutes -ge 10 -or $now -lt $cache.OldestAt) {
+        $oldest=Read-LogAnchor '*' $false
+        $cache.Oldest=$oldest
+        $cache.OldestAt=$now
+    }
     $cursor=$cache.Cursor
     $events=@($cache.Events | Where-Object { $_ -and $_.Time -ge $now.AddHours(-1) })
     if ($cursor) {
         $anchor=Read-LogAnchor "*[System[EventRecordID=$($cursor.Id)]]"
-        if (-not $anchor -or $anchor.Time -ne $cursor.Time) {$cursor=$null; $events=@()}
+        if (-not $anchor -or $anchor.Time -ne $cursor.Time) {
+            # Rebuild after rollover/clear and re-evaluate log coverage now.
+            $cursor=$null
+            $oldest=Read-LogAnchor '*' $false
+            $cache.Oldest=$oldest; $cache.OldestAt=$now
+        }
     }
     $pending=$false
     if ($head -and (-not $cursor -or $head.Id -gt $cursor.Id)) {
@@ -5109,6 +5268,7 @@ function Read-HealthWhea($cache,$now) {
                 try {
                     $xml=[xml]$e.ToXml()
                     $raw=$xml.SelectSingleNode("//*[local-name()='Data' and @Name='RawData']")
+                    if (-not $raw) {$raw=$xml.SelectSingleNode("//*[local-name()='EventData']/*[local-name()='Binary']")}
                     $class=Get-WheaClassification $e.Id $e.Level $raw.InnerText ''
                     if ($class -eq 'Unclassified') {
                         $msg=try {$e.FormatDescription()} catch {''}
@@ -5123,8 +5283,13 @@ function Read-HealthWhea($cache,$now) {
         } finally {$r.Dispose()}
     }
     if (-not $pending) {$cursor=$head}
-    # Keep recent evidence per severity even during a corrected-event storm.
-    $events=@(foreach ($group in ($events | Group-Object Class)) {$group.Group | Select-Object -Last 32})
+    # A record can arrive between sampling the clock and reading the head. Preserve it
+    # for the next pass even when its time is slightly newer than this assessment.
+    $unique=@{}
+    foreach ($entry in $events) {$unique[('{0}/{1}' -f $entry.RecordId,$entry.Time.Ticks)]=$entry}
+    $events=@(foreach ($group in ($unique.Values | Group-Object Class)) {
+        $group.Group | Sort-Object Time,RecordId | Select-Object -Last 32
+    })
     $result=Get-WheaCondition $events $now $pending
     if (-not $oldest -or $oldest.Time -gt $now.AddHours(-1)) {
         $result.Complete=$false
@@ -5136,6 +5301,43 @@ function Read-HealthWhea($cache,$now) {
 }
 
 function Read-HealthMemory($os,$now) {
+    # GetPerformanceInfo returns system-wide commit and free physical pages in one OS call.
+    # The type is initialized in this worker only; restricted hosts can still use Windows CIM.
+    if ($env:OS -eq 'Windows_NT' -and -not $script:HealthNativeMemoryDisabled) {
+        try {
+            if (-not ('ScriptXHealthNative.Memory' -as [type])) {
+                Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+namespace ScriptXHealthNative {
+    public static class Memory {
+        [StructLayout(LayoutKind.Sequential)]
+        private struct Info {
+            public uint Size;
+            public UIntPtr Commit, Limit, Peak, Total, Available, Cache, Kernel, Paged, Nonpaged, PageSize;
+            public uint Handles, Processes, Threads;
+        }
+        [DllImport("psapi.dll", SetLastError=true)]
+        private static extern bool GetPerformanceInfo(ref Info data, uint size);
+        public static double[] Read() {
+            Info data=new Info();
+            data.Size=(uint)Marshal.SizeOf(typeof(Info));
+            if(!GetPerformanceInfo(ref data,data.Size)) return null;
+            double page=data.PageSize.ToUInt64();
+            return new double[]{page*data.Total.ToUInt64(),page*data.Available.ToUInt64(),
+                page*data.Commit.ToUInt64(),page*data.Limit.ToUInt64()};
+        }
+    }
+}
+"@ -ErrorAction Stop
+            }
+            $b=[ScriptXHealthNative.Memory]::Read()
+            if ($null -ne $b -and $b[0] -gt 0 -and $b[1] -le $b[0] -and $b[3] -gt 0 -and $b[2] -le $b[3]) {
+                return [pscustomobject]@{At=$now;Total=$b[0];Available=$b[1];Commit=100.0*$b[2]/$b[3]
+                    CommittedBytes=$b[2];CommitLimit=$b[3];PageReads=$null;Source='Windows GetPerformanceInfo'}
+            }
+        } catch {$script:HealthNativeMemoryDisabled=$true}
+    }
     $m=Get-CimInstance -ClassName Win32_PerfFormattedData_PerfOS_Memory -OperationTimeoutSec 2 -ErrorAction Stop
     $total=[double]$os.TotalVisibleMemorySize*1KB
     $free=$m.AvailableBytes
@@ -5143,15 +5345,59 @@ function Read-HealthMemory($os,$now) {
     $commit=$m.PercentCommittedBytesInUse
     if ($null -ne $m.CommittedBytes -and $m.CommitLimit -gt 0) {$commit=100.0*$m.CommittedBytes/$m.CommitLimit}
     if ($total -le 0 -or $null -eq $free -or $free -lt 0 -or $free -gt $total -or $null -eq $commit -or $commit -lt 0 -or $commit -gt 100) {throw 'Inconsistent or missing Windows memory counters'}
-    [pscustomobject]@{At=$now;Total=$total;Available=$free;Commit=$commit;CommittedBytes=$m.CommittedBytes;CommitLimit=$m.CommitLimit;PageReads=$m.PageReadsPersec}
+    [pscustomobject]@{At=$now;Total=$total;Available=$free;Commit=$commit;CommittedBytes=$m.CommittedBytes;CommitLimit=$m.CommitLimit;PageReads=$m.PageReadsPersec;Source='Windows memory counters'}
 }
 
 function Read-HealthStorage($now,$context) {
     $ns='root/Microsoft/Windows/Storage'
-    $disks=@(Get-CimInstance -ClassName MSFT_PhysicalDisk -Namespace $ns -OperationTimeoutSec 2 -ErrorAction Stop)
-    if (-not $disks.Count) {throw 'Physical disk inventory is empty'}
-    $counters=try {@(Get-CimInstance -ClassName MSFT_StorageReliabilityCounter -Namespace $ns -OperationTimeoutSec 2 -ErrorAction Stop)} catch {@()}
-    $summary=Get-StorageHealthSummary $disks $counters $now
+    $storageError=''
+    try {$disks=@(Get-CimInstance -ClassName MSFT_PhysicalDisk -Namespace $ns -OperationTimeoutSec 2 -ErrorAction Stop)}
+    catch {$disks=@(); $storageError=$_.Exception.Message}
+    # Read optional reliability data per physical object on later worker passes.
+    $summary=Get-StorageHealthSummary $disks @() $now $context.Reliability
+    if ($storageError) {$summary.Reason+="; $storageError"}
+    $alarms=@{}
+    foreach ($row in $summary.Details) {
+        if (-not $row.Id) {continue}
+        if ($row.State -in @('Warning','Unhealthy')) {$alarms[$row.Id]=$row.State}
+        elseif ($row.State -eq 'Unknown' -and $context.DiskAlarms -and $context.DiskAlarms.ContainsKey($row.Id)) {
+            $alarms[$row.Id]=$context.DiskAlarms[$row.Id]
+            $summary.LastKnownStatus='Warning'; $summary.Complete=$false
+            if ($summary.Status -in @('Available','Unavailable')) {$summary.Status='Stale'}
+            $summary.Reason+="; $($row.Name) previously $($alarms[$row.Id]), status now unknown"
+        }
+    }
+    # An unavailable inventory cannot clear the last known device alarm.
+    if (-not $disks.Count -and $context.DiskAlarms.Count) {
+        $summary.Status='Stale'; $summary.LastKnownStatus='Warning'
+        $summary.Reason+='; previously reported device alarm has not been rechecked'
+    } else {$context.DiskAlarms=$alarms}
+    if (-not $summary.Complete -or $context.SmartAlerts.Count) {
+        # Legacy controllers may expose a driver prediction without exposing MSFT disk health.
+        # These provider identities stay separate from physical disk and volume identities.
+        $predictions=@()
+        $previous=$context.SmartAlerts
+        if (-not $previous) {$previous=@{}}
+        $alerts=$previous.Clone()
+        try {
+            $predictions=@(Get-CimInstance -Namespace root/wmi -ClassName MSStorageDriver_FailurePredictStatus -OperationTimeoutSec 2 -ErrorAction Stop)
+        } catch {$summary.Reason+='; driver SMART prediction unavailable'}
+        $activeAlert=$false
+        foreach ($entry in $predictions) {
+            $id=[string]$entry.InstanceName
+            if (-not $id -or $entry.PredictFailure -isnot [bool] -or $entry.Active -eq $false) {continue}
+            if ($entry.PredictFailure) {
+                $activeAlert=$true; $alerts[$id]=$true
+                $summary.Reason+="; SMART predicts failure on $id"
+            } else {$alerts.Remove($id)}
+        }
+        $context.SmartAlerts=$alerts
+        if ($activeAlert -and $summary.Status -ne 'Critical') {$summary.Status='Warning'}
+        elseif ($alerts.Count -and $summary.Status -notin @('Warning','Critical')) {
+            $summary.Status='Stale'; $summary.LastKnownStatus='Warning'
+            $summary.Reason+='; previous SMART alert has no fresh reading'
+        }
+    }
     $queue=@()
     $attempts=@{}
     $retained=@{}
@@ -5163,7 +5409,8 @@ function Read-HealthStorage($now,$context) {
         $cached=$context.Reliability[$id]
         if ($cached -and $now -ge $cached.At -and ($now-$cached.At).TotalMinutes -lt 10) {
             $row.Reliability=$cached; $retained[$id]=$cached
-        } else {$queue+=$physical}
+        } elseif (-not $attempts.ContainsKey($id) -or $now -lt $attempts[$id] -or
+            ($now-$attempts[$id]).TotalMinutes -ge 10) {$queue+=$physical}
     }
     $context.Reliability=$retained
     $context.DiskAttempts=$attempts
@@ -5206,23 +5453,42 @@ function New-ThermalSample($device,$kind,$value,$source,$at,$limit=$null) {
 function Get-HealthV2($cache,$os,$sensor,$cards,$now,$smi,$inventory) {
     if (-not $cache.HealthV2) {
         $slots=@{}
-        foreach ($p in @('Memory','Storage','WHEA','Nvidia','Thermal','Reliability')) {
+        foreach ($p in @('Memory','Storage','WHEA','Nvidia','Thermal','Reliability','OpenHardware')) {
             $slots[$p]=@{Next=[datetime]::MinValue;At=[datetime]::MinValue;Last=$null;Failures=0;Error=''}
         }
         $cache.HealthV2=@{Slots=$slots;History=@{};Log=@{};Reliability=@{};DiskAttempts=@{};PendingDisks=@();Last=[datetime]::MinValue}
     }
     $h=$cache.HealthV2
     if ($now -lt $h.Last -or ($now-$h.Last).TotalSeconds -gt 45) {
-        $h.History=@{}; $h.Slots.Memory.Evaluated=$null
-        foreach ($slot in $h.Slots.Values) {$slot.Next=$now; if ($slot.At -gt $now) {$slot.At=[datetime]::MinValue;$slot.Last=$null}}
+        # Discard trends after sleep; retain confirmed alarms for a fresh recovery window.
+        foreach ($id in @($h.History.Keys)) {
+            if ($h.History[$id].Level -eq 0) {$h.History.Remove($id)}
+        }
+        $h.Slots.Memory.Evaluated=$null
+        foreach ($slot in $h.Slots.Values) {if ($now -lt $h.Last) {$slot.Next=$now}; if ($slot.At -gt $now) {$slot.At=[datetime]::MinValue;$slot.Last=$null}}
     }
     $h.Last=$now
-    # At most one health-specific provider per shared worker pass.
-    foreach ($provider in @('Memory','WHEA','Storage','Nvidia','Reliability')) {
+    $samples=@($sensor.HealthSensors | Where-Object { $_ -and $_.At -le $now -and ($now-$_.At).TotalSeconds -le $_.Gap })
+    $needsCpu=$true; $needsGpu=$true
+    foreach ($ch in $samples) {
+        if ($ch.Kind -in @('CPU Package','CPU Margin')) {$needsCpu=$false}
+        if ($ch.Kind -eq 'GPU Core') {$needsGpu=$false}
+    }
+    foreach ($card in $cards) {
+        if ($card.Source -eq 'NVIDIA driver' -and $null -ne $card.Temp) {$needsGpu=$false}
+    }
+    # Serve the oldest deadline first. A slow shared telemetry pass must not starve disk or WHEA.
+    $provider=$null
+    foreach ($candidate in @('Memory','WHEA','Storage','Nvidia','OpenHardware','Reliability')) {
+        $due=$h.Slots[$candidate].Next
+        if ($due -gt $now -or ($candidate -eq 'Nvidia' -and -not $smi)) {continue}
+        if ($candidate -eq 'OpenHardware' -and -not ($needsCpu -or $needsGpu)) {continue}
+        if ($candidate -eq 'Reliability' -and (-not $h.PendingDisks.Count -or $h.Slots.Storage.Failures)) {continue}
+        if (-not $provider -or $due -lt $h.Slots[$provider].Next) {$provider=$candidate}
+    }
+    if ($provider) {
         $slot=$h.Slots[$provider]
-        if ($now -lt $slot.Next -or ($provider -eq 'Nvidia' -and -not $smi)) {continue}
-        if ($provider -eq 'Reliability' -and (-not $h.PendingDisks.Count -or $h.Slots.Storage.Failures)) {continue}
-        $period=@{Memory=15;Storage=120;WHEA=60;Nvidia=60;Reliability=30}[$provider]
+        $period=@{Memory=15;Storage=120;WHEA=60;Nvidia=60;OpenHardware=8;Reliability=30}[$provider]
         $started=[Diagnostics.Stopwatch]::GetTimestamp()
         try {
             $newValue=switch ($provider) {
@@ -5235,25 +5501,50 @@ function Get-HealthV2($cache,$os,$sensor,$cards,$now,$smi,$inventory) {
                     $reply=Invoke-CimMethod -InputObject $device -MethodName GetStorageReliabilityCounter -OperationTimeoutSec 2 -ErrorAction Stop
                     if ($null -eq $reply.ReturnValue -or $reply.ReturnValue -ne 0 -or -not $reply.StorageReliabilityCounter) {throw 'Reliability method unsupported'}
                     $counter=$reply.StorageReliabilityCounter
-                    $h.Reliability[[string]$device.ObjectId]=[pscustomobject]@{At=$now;Temperature=$counter.Temperature;Wear=$counter.Wear
-                        ReadErrorsUncorrected=$counter.ReadErrorsUncorrected;WriteErrorsUncorrected=$counter.WriteErrorsUncorrected}
+                    $fresh=[pscustomobject]@{At=$now;Temperature=$counter.Temperature;Wear=$counter.Wear
+                        ReadErrorsUncorrected=$counter.ReadErrorsUncorrected;WriteErrorsUncorrected=$counter.WriteErrorsUncorrected
+                        TemperatureMax=$counter.TemperatureMax}
+                    $key=[string]$device.ObjectId
+                    $h.Reliability[$key]=$fresh
+                    $storageSlot=$h.Slots.Storage
+                    if ($storageSlot.Last -and $storageSlot.Last.Details) {
+                        foreach ($row in $storageSlot.Last.Details) {
+                            if ($row.Id -eq $key) {
+                                $row.Reliability=$fresh
+                                Apply-StorageReliabilityEvidence $storageSlot.Last $row $fresh
+                                $storageSlot.At=$now
+                                break
+                            }
+                        }
+                    }
                     $true
                 }
                 WHEA {Read-HealthWhea $h.Log $now}
+                OpenHardware {Read-OptionalHealthSensors $now}
                 Nvidia {Read-NvidiaThermalPolicy $smi $now}
+            }
+            if ($provider -eq 'Storage' -and $newValue.Status -eq 'Unavailable' -and $slot.Last -and
+                ($slot.Last.Status -in @('Warning','Critical') -or $slot.Last.LastKnownStatus -in @('Warning','Critical'))) {
+                $newValue.Status='Stale'; $newValue.LastKnownStatus='Warning'
+                $newValue.Reason+='; prior storage alarm awaits a readable inventory'
             }
             $slot.Last=$newValue; $slot.At=$now; $slot.Failures=0; $slot.Error=''
             if ($provider -eq 'WHEA' -and $newValue.Reason -like '*catch-up pending*') {$period=5}
         } catch {
             $slot.Error=$_.Exception.Message; $slot.Failures=[math]::Min(4,$slot.Failures+1)
+            if ($provider -eq 'OpenHardware') {$period=120}
             $period=[math]::Min(300,$period*[math]::Pow(2,$slot.Failures-1))
         }
         $slot.DurationMs=[math]::Round(1000.0*([Diagnostics.Stopwatch]::GetTimestamp()-$started)/[Diagnostics.Stopwatch]::Frequency,2)
         $slot.Next=$now.AddSeconds($period)
-        break
     }
     $nv=$h.Slots.Nvidia
-    $samples=@($sensor.HealthSensors)
+    $optional=$h.Slots.OpenHardware
+    if ($optional.Last -and -not $optional.Failures -and ($now-$optional.At).TotalSeconds -le 18) {
+        foreach ($ch in $optional.Last) {
+            if (($needsCpu -and $ch.Kind -like 'CPU*') -or ($needsGpu -and $ch.Kind -like 'GPU*')) {$samples+=$ch}
+        }
+    }
     foreach ($g in $cards) {
         if ($g.Source -ne 'NVIDIA driver' -or $null -eq $g.Temp) {continue}
         $policy=if ($nv.Last -and ($now-$nv.At).TotalSeconds -le 130) {$nv.Last[$g.Id]}
@@ -5264,7 +5555,8 @@ function Get-HealthV2($cache,$os,$sensor,$cards,$now,$smi,$inventory) {
         }
     }
     # Duplicate providers can see the same GPU. Coverage uses inventory IDs, never display names alone.
-    $thermal=Get-ThermalConditionScore $samples $h.History $now @($inventory.Adapters).Count $inventory.CpuCount
+    $thermal=Get-ThermalConditionScore $samples $h.History $now @($inventory.Adapters | Where-Object {$_}).Count $inventory.CpuCount
+    if (-not $inventory.CpuCount -or -not @($inventory.Adapters | Where-Object {$_}).Count) {$thermal.Complete=$false}
     $lhmGpu=$false; $nvGpu=$false
     foreach ($s in $samples) {
         if ($s.Kind -ne 'GPU Core') {continue}
@@ -5273,13 +5565,17 @@ function Get-HealthV2($cache,$os,$sensor,$cards,$now,$smi,$inventory) {
     }
     if ($lhmGpu -and $nvGpu) {$thermal.Complete=$false}
     $tSlot=$h.Slots.Thermal
-    if ($thermal.Status -ne 'Unavailable') {$tSlot.Last=$thermal;$tSlot.At=$now}
+    if ($thermal.Status -notin @('Unavailable','Stale')) {$tSlot.Last=$thermal;$tSlot.At=$now}
     $categories=@{}
     foreach ($name in @('Memory','Storage','WHEA','Thermal')) {
         $slot=$h.Slots[$name]
         $ttl=@{Memory=45;Thermal=15;Storage=300;WHEA=150}[$name]
         $ok=$slot.Last -and ($now-$slot.At).TotalSeconds -le $ttl -and -not $slot.Failures
-        if ($name -eq 'Thermal' -and $thermal.Status -eq 'Unavailable') {$ok=$false}
+        if ($name -eq 'Thermal' -and $thermal.Status -eq 'Stale') {$categories[$name]=$thermal;continue}
+        if ($name -eq 'Thermal' -and $thermal.Status -eq 'Unavailable') {
+            if (-not $slot.Last) {$categories[$name]=$thermal;continue}
+            $ok=$false
+        }
         if ($ok) {
             if ($name -eq 'Memory') {
                 if (-not $slot.Evaluated -or $slot.Evaluated.Timestamp -ne $slot.At) {
@@ -5292,6 +5588,10 @@ function Get-HealthV2($cache,$os,$sensor,$cards,$now,$smi,$inventory) {
             $state=if ($slot.Last) {'Stale'} else {'Unavailable'}
             $c=New-Condition $name $state $why $slot.At $false
             if ($slot.Last) {
+                $previous=if ($name -eq 'Memory') {$slot.Evaluated} else {$slot.Last}
+                if ($previous) {
+                    $c.LastKnownStatus=if ($previous.LastKnownStatus) {$previous.LastKnownStatus} else {$previous.Status}
+                } elseif ($name -eq 'Memory' -and $h.History.Memory.Level -gt 0) {$c.LastKnownStatus='Warning'}
                 $c.Details=$slot.Last
                 $c.Reason+="; last successful sample $($slot.At.ToString('u'))"
                 if ($slot.Last.Reason) {$c.Reason+=": $($slot.Last.Reason)"}
@@ -5301,7 +5601,7 @@ function Get-HealthV2($cache,$os,$sensor,$cards,$now,$smi,$inventory) {
     }
     $estimate=Get-OperatingEstimate $categories.Thermal $categories.Memory $categories.Storage $categories.WHEA $now
     $timings=@{}
-    foreach ($name in @('Memory','Storage','WHEA','Nvidia','Reliability')) {$timings[$name]=$h.Slots[$name].DurationMs}
+    foreach ($name in @('Memory','Storage','WHEA','Nvidia','OpenHardware','Reliability')) {$timings[$name]=$h.Slots[$name].DurationMs}
     $estimate.LastQueryMs=$timings
     $estimate
 }
@@ -5492,6 +5792,17 @@ if ($worker.HadErrors) {
 
 $worker.Commands.Clear()
 
+function Update-HealthAvailability {
+    if ($script:LastHealthResult) {
+        $age=([datetime]::UtcNow-$script:LastHealthResult.Timestamp).TotalSeconds
+        if ($age -ge 0 -and $age -le 15) {return}
+        $script:LastHealthResult=$null
+        Reset-SystemHealth 'STALE DATA'
+    } elseif ($ui.HealthState.Text -notin @('STALE DATA','DATA UNAVAILABLE')) {
+        Reset-SystemHealth 'DATA UNAVAILABLE'
+    }
+}
+
 function Restore-HealthView {
     if ($state.Closing -or -not $ui.HomePage.IsVisible -or $window.WindowState -eq [Windows.WindowState]::Minimized) { return }
     if ($null -ne $script:LastHealthResult) {
@@ -5515,8 +5826,10 @@ function Start-Reading {
     $options=$script:Config.Clone()
     $elapsedMs=$meterSampleClock.Elapsed.TotalMilliseconds
     $onHome=$ui.HomePage.IsVisible -and $window.WindowState -ne [Windows.WindowState]::Minimized
-    $options.HealthActive=$onHome -or ($elapsedMs-$script:LastHealthRequestMs -ge 8000)
-    if ($options.HealthActive) { $script:LastHealthRequestMs=$elapsedMs }
+    # Health-only disk/WHEA queries are unnecessary outside HOME. Resume on
+    # return; no background health polling while customers use other pages.
+    $options.HealthActive=$onHome
+    if ($onHome) { $script:LastHealthRequestMs=$elapsedMs }
     [void]$worker.AddCommand('Get-Telemetry').AddParameter(
         'Config',
         $options
@@ -5804,6 +6117,14 @@ $timer.Add_Tick({
                 throw 'No telemetry snapshot returned'
             }
 
+            # Accept this independent provider result even if a different card reports an error.
+            $healthResult=$r[-1].HealthV2
+            if ($null -ne $healthResult) {
+                $script:LastHealthResult=$healthResult
+                if ($ui.HomePage.IsVisible -and $window.WindowState -ne [Windows.WindowState]::Minimized) {
+                    Update-SystemHealth $healthResult
+                }
+            }
             if ($worker.Streams.Error.Count) {
                 throw 'A telemetry provider failed'
             }
@@ -5813,9 +6134,8 @@ $timer.Add_Tick({
         catch {
             $ui.Connection.Text = '● DATA UNAVAILABLE / RETRYING'
             Show-NetworkReading $null
-            $script:LastHealthResult=$null
-            Reset-SystemHealth 'DATA UNAVAILABLE'
-                }
+            Update-HealthAvailability
+        }
         finally {
             $state.Pending = $null
         }
@@ -5835,8 +6155,7 @@ $timer.Add_Tick({
     ) {
         $ui.Connection.Text = '● STALE DATA / WAITING FOR PROVIDERS'
         Show-NetworkReading $null
-        $script:LastHealthResult=$null
-        Reset-SystemHealth 'DATA UNAVAILABLE'
+        Update-HealthAvailability
     }
 })
 
