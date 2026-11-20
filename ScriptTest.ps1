@@ -122,6 +122,14 @@ Write-HsStartupLog ('BOOT_CONTINUE: Elevated={0}, STA={1}, 64bit={2}' -f `
 
 Add-Type -AssemblyName PresentationFramework,PresentationCore,WindowsBase
 
+# Compatibility: keep all program text in ASCII source form; WPF renders real Unicode.
+# This avoids mojibake if a distribution/editor mishandles non-ASCII PS 5.1 source.
+$script:DisplayDash = [string][char]0x2014
+$script:DisplayDot = [string][char]0x00B7
+$script:DisplayDegree = [string][char]0x00B0
+$script:DisplayBullet = [string][char]0x25CF
+
+
 
 
 # Broad game capture on Windows via PresentMon (DX/OpenGL/Vulkan); no
@@ -1497,7 +1505,7 @@ function Update-RealGameFps {
         }
         # An RTSS fallback cannot supply per-frame 1% lows. Debounce its
         # staleness independently so rapid source handovers do not flash it.
-        if ($ui.FpsLow.Text -ne '—' -and $script:FpsUiLastLowMeasuredUtc -ne [datetime]::MinValue -and
+        if ($ui.FpsLow.Text -ne $script:DisplayDash -and $script:FpsUiLastLowMeasuredUtc -ne [datetime]::MinValue -and
             ($now - $script:FpsUiLastLowMeasuredUtc).TotalMilliseconds -ge $script:FpsUiStaleGraceMs) {
             $ui.FpsLow.Opacity = 0.66
         }
@@ -2015,6 +2023,8 @@ $script:Config = @{
    </Setter>
   </Style>
 
+  <ScaleTransform x:Key="SidebarIconScale" ScaleX="1.18" ScaleY="1.18"/>
+
   <!-- FPS hero and five-field SHOW SPEC rail: glass, but NO hover motion. -->
   <Style x:Key="CardStatic" TargetType="Border" BasedOn="{StaticResource CardSurface}"/>
 
@@ -2054,17 +2064,12 @@ $script:Config = @{
 
   <SolidColorBrush x:Key="StorageTileText" Color="#F5F5F7"/>
 
-  <LinearGradientBrush x:Key="NavSelectedGlass" StartPoint="0,0" EndPoint="1,0.75">
-   <GradientStop Color="#120A84FF" Offset="0"/>
-   <GradientStop Color="#18212834" Offset="0.38"/>
-   <GradientStop Color="#27203248" Offset="1"/>
-  </LinearGradientBrush>
-
   <Style TargetType="Button">
    <Setter Property="Foreground" Value="#A1A1A6"/>
    <Setter Property="Background" Value="Transparent"/>
    <Setter Property="Cursor" Value="Hand"/>
    <Setter Property="Padding" Value="12,12"/>
+   <Setter Property="FocusVisualStyle" Value="{x:Null}"/>
    <Setter Property="Template">
     <Setter.Value>
      <ControlTemplate TargetType="Button">
@@ -2078,14 +2083,32 @@ $script:Config = @{
       </Border>
       <ControlTemplate.Triggers>
        <Trigger Property="IsMouseOver" Value="True">
-        <Setter TargetName="ButtonBorder" Property="Background" Value="#26344B64"/>
-        <Setter Property="Foreground" Value="#F5F5F7"/>
+        <Setter TargetName="ButtonBorder" Property="Background" Value="#16384D65"/>
+        <Setter Property="Foreground" Value="#FFFFFF"/>
        </Trigger>
       </ControlTemplate.Triggers>
      </ControlTemplate>
     </Setter.Value>
    </Setter>
   </Style>
+
+
+  <DoubleAnimation x:Key="NavSelectionReveal" From="0" To="1" Duration="0:0:0.75" FillBehavior="Stop">
+   <DoubleAnimation.EasingFunction><SineEase EasingMode="EaseInOut"/></DoubleAnimation.EasingFunction>
+  </DoubleAnimation>
+
+  <DoubleAnimation x:Key="NavMarkerFade" From="0" To="1" Duration="0:0:0.45" FillBehavior="HoldEnd">
+   <DoubleAnimation.EasingFunction><SineEase EasingMode="EaseInOut"/></DoubleAnimation.EasingFunction>
+  </DoubleAnimation>
+
+  <!-- Transparent button faces reveal the shared selection frame below them. -->
+  <ControlTemplate x:Key="SidebarNavButtonTemplate" TargetType="Button">
+   <Grid Background="Transparent" SnapsToDevicePixels="True">
+    <ContentPresenter HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}"
+                      VerticalAlignment="Center" Margin="{TemplateBinding Padding}"
+                      RecognizesAccessKey="True"/>
+   </Grid>
+  </ControlTemplate>
 
   <!-- Plain, low-overhead meters for Storage. -->
   <Style TargetType="ProgressBar">
@@ -2420,10 +2443,16 @@ $script:Config = @{
     <StackPanel Orientation="Horizontal" HorizontalAlignment="Right"
                 VerticalAlignment="Center" Margin="0,0,8,0"
                 >
-     <Button shell:WindowChrome.IsHitTestVisibleInChrome="True" x:Name="Minimize" Content="" FontFamily="Segoe MDL2 Assets"
-             Width="32" Height="30" Padding="6"/>
-     <Button shell:WindowChrome.IsHitTestVisibleInChrome="True" x:Name="Close" Content="" FontFamily="Segoe MDL2 Assets"
-             Width="32" Height="30" Padding="6"/>
+     <Button shell:WindowChrome.IsHitTestVisibleInChrome="True" x:Name="Minimize"
+             Width="32" Height="30" Padding="6">
+      <Path Width="13" Height="13" Stretch="Uniform" Data="M2,8 H14" Stroke="#BED0E2"
+            StrokeThickness="1.4" StrokeStartLineCap="Round" StrokeEndLineCap="Round"/>
+     </Button>
+     <Button shell:WindowChrome.IsHitTestVisibleInChrome="True" x:Name="Close"
+             Width="32" Height="30" Padding="6">
+      <Path Width="12" Height="12" Stretch="Uniform" Data="M3,3 L13,13 M13,3 L3,13"
+            Stroke="#BED0E2" StrokeThickness="1.4" StrokeStartLineCap="Round" StrokeEndLineCap="Round"/>
+     </Button>
     </StackPanel>
     <!-- Continuous hairline under the header, with no separate header fill. -->
     <Border VerticalAlignment="Bottom" Height="1" IsHitTestVisible="False">
@@ -2440,14 +2469,14 @@ $script:Config = @{
 
    <Grid Grid.Row="1" Background="Transparent">
     <Grid.ColumnDefinitions>
-     <ColumnDefinition Width="180"/>
+     <ColumnDefinition Width="190"/>
      <ColumnDefinition Width="*"/>
     </Grid.ColumnDefinitions>
 
     <!-- Seamless sidebar: shares the exact body background. -->
     <Border Background="Transparent" BorderThickness="0" Padding="0">
      <Viewbox Stretch="Uniform" StretchDirection="DownOnly">
-      <DockPanel Margin="10,20,10,16" Width="156" Height="642">
+      <DockPanel Margin="12,20,12,16" Width="166" Height="642">
        <ContentControl DockPanel.Dock="Bottom" Style="{StaticResource CardHoverHost}">
         <Border Style="{StaticResource CardSurface}"
                 Padding="10" CornerRadius="15">
@@ -2465,12 +2494,33 @@ $script:Config = @{
                        FontSize="7" x:Name="ProfileMachine"/>
            </StackPanel>
           </StackPanel>
-          <TextBlock Text="● LOCAL MONITOR" Style="{StaticResource Label}"
+          <TextBlock Text="&#x25CF; LOCAL MONITOR" Style="{StaticResource Label}"
                      FontSize="7" Margin="0,12,0,0" x:Name="ProfileStatus"/>
          </StackPanel>
         </Border>
        </ContentControl>
 
+       <Grid>
+        <Canvas x:Name="NavSelectionLayer" IsHitTestVisible="False" ClipToBounds="True">
+         <Border x:Name="NavSelectionFrame" Opacity="0" CornerRadius="10" BorderThickness="0.65"
+                 BorderBrush="#49D6DADF" UseLayoutRounding="False" SnapsToDevicePixels="False">
+          <Border.Background>
+           <LinearGradientBrush StartPoint="0.16,0" EndPoint="0.84,1" MappingMode="RelativeToBoundingBox">
+            <GradientStop Offset="0" Color="#40EDF2F6"/>
+            <GradientStop Offset="0.32" Color="#28DAE2E9"/>
+            <GradientStop Offset="0.70" Color="#13C3CED7"/>
+            <GradientStop Offset="1" Color="#24DBE3E9"/>
+           </LinearGradientBrush>
+          </Border.Background>
+          <Border x:Name="NavSelectionMarker" Width="2.5" Height="16" CornerRadius="1.25"
+                  HorizontalAlignment="Right" VerticalAlignment="Center" Margin="0,0,9,0"
+                  Background="White" Opacity="0">
+           <Border.Effect>
+            <DropShadowEffect Color="White" BlurRadius="6" ShadowDepth="0" Opacity="0.78"/>
+           </Border.Effect>
+          </Border>
+         </Border>
+        </Canvas>
        <StackPanel>
         <StackPanel Orientation="Horizontal" Margin="1,0,0,29">
          <Border Width="44" Height="44" Background="#35435B80"
@@ -2486,57 +2536,120 @@ $script:Config = @{
          </StackPanel>
         </StackPanel>
 
-        <TextBlock Text="M A I N" Style="{StaticResource Label}" FontSize="9.5" FontWeight="Bold"
-                   Foreground="#86868B" Margin="7,0,0,11"/>
-        <Button x:Name="Home" Tag="Home" Background="{StaticResource NavSelectedGlass}"
-                Foreground="#DDE3ED" Margin="0,0,0,8" HorizontalContentAlignment="Left" FontSize="11" FontWeight="Bold" Padding="11,11">
-         <StackPanel Orientation="Horizontal">
-          <TextBlock Text="" FontFamily="Segoe MDL2 Assets" FontSize="15" Margin="0,0,12,0"/>
-          <TextBlock Text="HOME" FontWeight="Bold" FontSize="11"/>
-         </StackPanel>
+        <TextBlock Text="M A I N" Style="{StaticResource Label}" FontSize="10" FontWeight="Bold"
+                   Foreground="#91A0B0" Margin="8,0,0,13"/>
+        <Button x:Name="Home" Tag="Home" Background="Transparent"
+                Foreground="#FFFFFF" Margin="0,0,0,12" MinHeight="44" HorizontalContentAlignment="Stretch" FontSize="12" FontWeight="Bold" Padding="11,8" FocusVisualStyle="{x:Null}" Template="{StaticResource SidebarNavButtonTemplate}">
+         <Grid Height="26" VerticalAlignment="Center">
+          <Grid.ColumnDefinitions>
+           <ColumnDefinition Width="28"/>
+           <ColumnDefinition Width="16"/>
+           <ColumnDefinition Width="*"/>
+          </Grid.ColumnDefinitions>
+          <Grid Grid.Column="0" Width="28" Height="28" VerticalAlignment="Center" SnapsToDevicePixels="True">
+           <Grid Width="18" Height="18" VerticalAlignment="Center" HorizontalAlignment="Center" SnapsToDevicePixels="True">
+            <!-- HOME: familiar outline house with a centered doorway; font-independent WPF geometry. -->
+            <Canvas Width="18" Height="18" SnapsToDevicePixels="True" UseLayoutRounding="True">
+             <Path Data="M2.1,8.4 L9,2.7 L15.9,8.4 M4.4,7.8 V15.45 H13.6 V7.8 M7.3,15.45 V10.7 H10.7 V15.45"
+                   Fill="Transparent" Stroke="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}"
+                   StrokeThickness="1.7" StrokeLineJoin="Round" StrokeStartLineCap="Round" StrokeEndLineCap="Round"/>
+            </Canvas>
+           </Grid>
+          </Grid>
+          <TextBlock Grid.Column="2" Text="HOME" FontWeight="Bold" FontSize="11" VerticalAlignment="Center" TextWrapping="NoWrap"/>
+         </Grid>
         </Button>
 
         <TextBlock Text="T U N E"
-                   Style="{StaticResource Label}" FontSize="9.5" FontWeight="Bold"
-                   Foreground="#86868B" Margin="7,17,0,11"/>
+                   Style="{StaticResource Label}" FontSize="10" FontWeight="Bold"
+                   Foreground="#91A0B0" Margin="8,19,0,13"/>
 
-        <Button x:Name="Boost" Tag="FPS TWEAK" Background="Transparent"
-                Foreground="#9EAFBF" Margin="0,0,0,8" HorizontalContentAlignment="Left" FontSize="11" FontWeight="Bold" Padding="11,11">
-         <StackPanel Orientation="Horizontal">
-          <TextBlock Text="" FontFamily="Segoe MDL2 Assets" FontSize="15" Margin="0,0,12,0"/>
-          <TextBlock Text="FPS TWEAK" FontWeight="Bold" FontSize="11"/>
-         </StackPanel>
+        <Button x:Name="Boost" Tag="PC TUNE" Background="Transparent"
+                Foreground="#FFFFFF" Margin="0,0,0,12" MinHeight="44" HorizontalContentAlignment="Stretch" FontSize="12" FontWeight="Bold" Padding="11,8" FocusVisualStyle="{x:Null}" Template="{StaticResource SidebarNavButtonTemplate}">
+         <Grid Height="26" VerticalAlignment="Center">
+          <Grid.ColumnDefinitions>
+           <ColumnDefinition Width="28"/>
+           <ColumnDefinition Width="16"/>
+           <ColumnDefinition Width="*"/>
+          </Grid.ColumnDefinitions>
+          <Grid Grid.Column="0" Width="28" Height="28" VerticalAlignment="Center" SnapsToDevicePixels="True">
+           <Grid Width="18" Height="18" VerticalAlignment="Center" HorizontalAlignment="Center" SnapsToDevicePixels="True">
+            <Path Width="15" Height="15" Stretch="None" Data="M8.12,2.99 H3.18 A1.48,1.48 0 0 0 1.70,4.47 V9.99 A1.48,1.48 0 0 0 3.18,11.47 H11.78 A1.48,1.48 0 0 0 13.26,9.99 V8.89 M7.48,11.47 V13.42 M4.91,13.42 H10.05" Fill="Transparent" StrokeThickness="1.35" StrokeLineJoin="Round" StrokeStartLineCap="Round" StrokeEndLineCap="Round" Stroke="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}" RenderTransformOrigin="0.5,0.5" RenderTransform="{StaticResource SidebarIconScale}"/>
+            <Path Width="15" Height="15" Stretch="None" Data="F0 M10.47,1.92 L10.69,1.32 L11.83,1.32 L12.05,1.92 L12.23,1.99 L12.81,1.72 L13.62,2.53 L13.35,3.11 L13.42,3.29 L14.02,3.51 L14.02,4.65 L13.42,4.87 L13.35,5.05 L13.62,5.63 L12.81,6.44 L12.23,6.17 L12.05,6.24 L11.83,6.84 L10.69,6.84 L10.47,6.24 L10.29,6.17 L9.71,6.44 L8.90,5.63 L9.17,5.05 L9.10,4.87 L8.50,4.65 L8.50,3.51 L9.10,3.29 L9.17,3.11 L8.90,2.53 L9.71,1.72 L10.29,1.99 Z M12.36,4.08 A1.10,1.10 0 1 1 10.16,4.08 A1.10,1.10 0 1 1 12.36,4.08 Z" Fill="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}" RenderTransformOrigin="0.5,0.5" RenderTransform="{StaticResource SidebarIconScale}"/>
+           </Grid>
+          </Grid>
+          <TextBlock Grid.Column="2" Text="PC TUNE" FontWeight="Bold" FontSize="11" VerticalAlignment="Center" TextWrapping="NoWrap"/>
+         </Grid>
         </Button>
 
         <Button x:Name="Latency" Tag="Latency" Background="Transparent"
-                Foreground="#9EAFBF" Margin="0,0,0,8" HorizontalContentAlignment="Left" FontSize="11" FontWeight="Bold" Padding="11,11">
-         <StackPanel Orientation="Horizontal">
-          <TextBlock Text="" FontFamily="Segoe MDL2 Assets" FontSize="15" Margin="0,0,12,0"/>
-          <TextBlock Text="LATENCY" FontWeight="Bold" FontSize="11"/>
-         </StackPanel>
+                Foreground="#FFFFFF" Margin="0,0,0,12" MinHeight="44" HorizontalContentAlignment="Stretch" FontSize="12" FontWeight="Bold" Padding="11,8" FocusVisualStyle="{x:Null}" Template="{StaticResource SidebarNavButtonTemplate}">
+         <Grid Height="26" VerticalAlignment="Center">
+          <Grid.ColumnDefinitions>
+           <ColumnDefinition Width="28"/>
+           <ColumnDefinition Width="16"/>
+           <ColumnDefinition Width="*"/>
+          </Grid.ColumnDefinitions>
+          <Grid Grid.Column="0" Width="28" Height="28" VerticalAlignment="Center" SnapsToDevicePixels="True">
+           <Grid Width="18" Height="18" VerticalAlignment="Center" HorizontalAlignment="Center" SnapsToDevicePixels="True">
+            <Canvas Width="18" Height="18" SnapsToDevicePixels="True" UseLayoutRounding="True">
+             <Path Data="M3.2,9.5 V7.2 C3.2,4.7 5.3,3.2 7.9,3.2 H13.1 M10.4,1.35 L13.1,3.2 L10.4,5.05" Fill="Transparent" Stroke="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}" StrokeThickness="1.65" StrokeLineJoin="Round" StrokeStartLineCap="Round" StrokeEndLineCap="Round"/>
+             <Path Data="M14.8,8.5 V10.8 C14.8,13.3 12.7,14.8 10.1,14.8 H4.9 M7.6,12.95 L4.9,14.8 L7.6,16.65" Fill="Transparent" Stroke="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}" StrokeThickness="1.65" StrokeLineJoin="Round" StrokeStartLineCap="Round" StrokeEndLineCap="Round"/>
+            </Canvas>
+           </Grid>
+          </Grid>
+          <TextBlock Grid.Column="2" Text="LATENCY" FontWeight="Bold" FontSize="11" VerticalAlignment="Center" TextWrapping="NoWrap"/>
+         </Grid>
         </Button>
 
         <Button x:Name="Network" Tag="Network" Background="Transparent"
-                Foreground="#9EAFBF" Margin="0,0,0,8" HorizontalContentAlignment="Left" FontSize="11" FontWeight="Bold" Padding="11,11">
-         <StackPanel Orientation="Horizontal">
-          <TextBlock Text="" FontFamily="Segoe MDL2 Assets" FontSize="15" Margin="0,0,12,0"/>
-          <TextBlock Text="NETWORK" FontWeight="Bold" FontSize="11"/>
-         </StackPanel>
+                Foreground="#FFFFFF" Margin="0,0,0,12" MinHeight="44" HorizontalContentAlignment="Stretch" FontSize="12" FontWeight="Bold" Padding="11,8" FocusVisualStyle="{x:Null}" Template="{StaticResource SidebarNavButtonTemplate}">
+         <Grid Height="26" VerticalAlignment="Center">
+          <Grid.ColumnDefinitions>
+           <ColumnDefinition Width="28"/>
+           <ColumnDefinition Width="16"/>
+           <ColumnDefinition Width="*"/>
+          </Grid.ColumnDefinitions>
+          <Grid Grid.Column="0" Width="28" Height="28" VerticalAlignment="Center" SnapsToDevicePixels="True">
+           <Grid Width="18" Height="18" VerticalAlignment="Center" HorizontalAlignment="Center" SnapsToDevicePixels="True">
+            <Canvas Width="18" Height="18" SnapsToDevicePixels="True" UseLayoutRounding="True">
+             <Path Data="M1.8,16.2 A14.4,14.4 0 0 1 16.2,1.8" Fill="Transparent" Stroke="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}" StrokeThickness="1.95" StrokeStartLineCap="Square" StrokeEndLineCap="Square"/>
+             <Path Data="M5.3,16.2 A10.9,10.9 0 0 1 16.2,5.3" Fill="Transparent" Stroke="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}" StrokeThickness="1.95" StrokeStartLineCap="Square" StrokeEndLineCap="Square"/>
+             <Path Data="M8.9,16.2 A7.3,7.3 0 0 1 16.2,8.9" Fill="Transparent" Stroke="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}" StrokeThickness="1.95" StrokeStartLineCap="Square" StrokeEndLineCap="Square"/>
+             <Rectangle Canvas.Left="13.55" Canvas.Top="13.55" Width="2.5" Height="2.5" RadiusX="0.75" RadiusY="0.75" Fill="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}"/>
+            </Canvas>
+           </Grid>
+          </Grid>
+          <TextBlock Grid.Column="2" Text="NETWORK" FontWeight="Bold" FontSize="11" VerticalAlignment="Center" TextWrapping="NoWrap"/>
+         </Grid>
         </Button>
 
         <TextBlock Text="S Y S T E M"
-                   Style="{StaticResource Label}" FontSize="9.5" FontWeight="Bold"
-                   Foreground="#86868B" Margin="7,17,0,11"/>
+                   Style="{StaticResource Label}" FontSize="10" FontWeight="Bold"
+                   Foreground="#91A0B0" Margin="8,19,0,13"/>
 
         <Button x:Name="Cleanup" Tag="Clean Up" Background="Transparent"
-                Foreground="#9EAFBF" Margin="0,0,0,8" HorizontalContentAlignment="Left" FontSize="11" FontWeight="Bold" Padding="11,11">
-         <StackPanel Orientation="Horizontal">
-          <TextBlock Text="" FontFamily="Segoe MDL2 Assets" FontSize="15" Margin="0,0,12,0"/>
-          <TextBlock Text="CLEAN UP" FontWeight="Bold" FontSize="11"/>
-         </StackPanel>
+                Foreground="#FFFFFF" Margin="0,0,0,12" MinHeight="44" HorizontalContentAlignment="Stretch" FontSize="12" FontWeight="Bold" Padding="11,8" FocusVisualStyle="{x:Null}" Template="{StaticResource SidebarNavButtonTemplate}">
+         <Grid Height="26" VerticalAlignment="Center">
+          <Grid.ColumnDefinitions>
+           <ColumnDefinition Width="28"/>
+           <ColumnDefinition Width="16"/>
+           <ColumnDefinition Width="*"/>
+          </Grid.ColumnDefinitions>
+          <Grid Grid.Column="0" Width="28" Height="28" VerticalAlignment="Center" SnapsToDevicePixels="True">
+           <Canvas Width="18" Height="18" VerticalAlignment="Center" HorizontalAlignment="Center" SnapsToDevicePixels="True" UseLayoutRounding="True">
+            <Path Data="M6.1,2.8 H11.9" Stroke="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}" StrokeThickness="1.65" StrokeStartLineCap="Round" StrokeEndLineCap="Round" Fill="Transparent"/>
+            <Path Data="M2.4,5.0 H15.6" Stroke="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}" StrokeThickness="1.9" StrokeStartLineCap="Round" StrokeEndLineCap="Round" Fill="Transparent"/>
+            <Path Data="M3.8,6.7 L5.1,15.0 Q5.2,15.5 5.7,15.5 H12.3 Q12.8,15.5 12.9,15.0 L14.2,6.7" Stroke="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}" StrokeThickness="1.65" StrokeLineJoin="Round" StrokeStartLineCap="Round" StrokeEndLineCap="Round" Fill="Transparent"/>
+            <Path Data="M7.4,8.7 L7.25,12.75 M10.6,8.7 L10.75,12.75" Stroke="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}" StrokeThickness="1.4" StrokeStartLineCap="Round" StrokeEndLineCap="Round" Fill="Transparent"/>
+           </Canvas>
+          </Grid>
+          <TextBlock Grid.Column="2" Text="CLEAN UP" FontWeight="Bold" FontSize="11" VerticalAlignment="Center" TextWrapping="NoWrap"/>
+         </Grid>
         </Button>
 
        </StackPanel>
+       </Grid>
       </DockPanel>
      </Viewbox>
     </Border>
@@ -2580,7 +2693,7 @@ $script:Config = @{
        </Grid.RowDefinitions>
 
        <!-- Header -->
-       <Grid Grid.Row="0">
+       <Grid x:Name="HomeEntranceHeader" Grid.Row="0" Opacity="0">
         <Grid.ColumnDefinitions>
          <ColumnDefinition Width="*"/>
          <ColumnDefinition Width="Auto"/>
@@ -2603,7 +2716,7 @@ $script:Config = @{
          <Border Style="{StaticResource Icon}" Padding="10,6">
           <StackPanel>
            <TextBlock Text="U P T I M E" Style="{StaticResource Label}" FontSize="8" FontWeight="Bold"/>
-           <TextBlock Text="—" FontSize="10"
+           <TextBlock Text="&#x2014;" FontSize="10"
                       Margin="0,3,0,0" x:Name="Uptime"/>
           </StackPanel>
          </Border>
@@ -2618,7 +2731,7 @@ $script:Config = @{
        </Grid>
 
        <!-- FPS and hardware cards -->
-       <Grid x:Name="PerformanceRow" Grid.Row="2">
+       <Grid x:Name="PerformanceRow" Grid.Row="2" Opacity="0">
         <Grid.ColumnDefinitions>
          <ColumnDefinition Width="378"/>
          <ColumnDefinition Width="12"/>
@@ -2678,7 +2791,7 @@ $script:Config = @{
                     SnapsToDevicePixels="False">
             <Canvas Width="220" Height="172" ClipToBounds="False"
                     SnapsToDevicePixels="False">
-             <!-- v5.36 · Precision Etched Dial. A 5/12 major-minor tick rhythm
+             <!-- v5.36 &#x00B7; Precision Etched Dial. A 5/12 major-minor tick rhythm
                   replaces the old dots, perimeter arc and top glint. Ticks sit
                   outside the live FPS gauge; no overlap or animation. -->
              <!-- Fine inset engraving: twelve short graphite-pearl indices. -->
@@ -2882,14 +2995,14 @@ $script:Config = @{
                <TextBlock Text="{Binding Text, ElementName=CpuValue}" FontSize="24"
                           FontWeight="Bold" VerticalAlignment="Center" TextWrapping="NoWrap"
                           Style="{StaticResource HardwareBlackTextShadow}"/>
-               <TextBlock x:Name="CpuValue" Text="—" FontSize="24"
+               <TextBlock x:Name="CpuValue" Text="&#x2014;" FontSize="24"
                          FontWeight="Bold" VerticalAlignment="Center" TextWrapping="NoWrap"/>
               </Grid>
               <Border Grid.Column="1" Background="#382A415A" Padding="9,4"
                       CornerRadius="9" VerticalAlignment="Center" Margin="8,0,0,0">
                <Grid>
 
-  <TextBlock x:Name="CpuBadge" Text="—" FontSize="9.5"
+  <TextBlock x:Name="CpuBadge" Text="&#x2014;" FontSize="9.5"
                            FontWeight="Bold" Foreground="#67C7FF" TextWrapping="NoWrap"/>
                </Grid>
               </Border>
@@ -2955,14 +3068,14 @@ $script:Config = @{
                <TextBlock Text="{Binding Text, ElementName=GpuValue}" FontSize="24"
                           FontWeight="Bold" VerticalAlignment="Center" TextWrapping="NoWrap"
                           Style="{StaticResource HardwareBlackTextShadow}"/>
-               <TextBlock x:Name="GpuValue" Text="—" FontSize="24"
+               <TextBlock x:Name="GpuValue" Text="&#x2014;" FontSize="24"
                          FontWeight="Bold" VerticalAlignment="Center" TextWrapping="NoWrap"/>
               </Grid>
               <Border Grid.Column="1" Background="#34253D38" Padding="9,4"
                       CornerRadius="9" VerticalAlignment="Center" Margin="8,0,0,0">
                <Grid>
 
-  <TextBlock x:Name="GpuBadge" Text="—" FontSize="9.5"
+  <TextBlock x:Name="GpuBadge" Text="&#x2014;" FontSize="9.5"
                            FontWeight="Bold" Foreground="#67EEB2" TextWrapping="NoWrap"/>
                </Grid>
               </Border>
@@ -3028,14 +3141,14 @@ $script:Config = @{
                <TextBlock Text="{Binding Text, ElementName=RamValue}" FontSize="24"
                           FontWeight="Bold" VerticalAlignment="Center" TextWrapping="NoWrap"
                           Style="{StaticResource HardwareBlackTextShadow}"/>
-               <TextBlock x:Name="RamValue" Text="—" FontSize="24"
+               <TextBlock x:Name="RamValue" Text="&#x2014;" FontSize="24"
                          FontWeight="Bold" VerticalAlignment="Center" TextWrapping="NoWrap"/>
               </Grid>
               <Border Grid.Column="1" Background="#383E3351" Padding="9,4"
                       CornerRadius="9" VerticalAlignment="Center" Margin="8,0,0,0">
                <Grid>
 
-  <TextBlock x:Name="RamBadge" Text="—" FontSize="9.5"
+  <TextBlock x:Name="RamBadge" Text="&#x2014;" FontSize="9.5"
                            FontWeight="Bold" Foreground="#C9A1FF" TextWrapping="NoWrap"/>
                </Grid>
               </Border>
@@ -3101,14 +3214,14 @@ $script:Config = @{
                <TextBlock Text="{Binding Text, ElementName=TempValue}" FontSize="24"
                           FontWeight="Bold" VerticalAlignment="Center" TextWrapping="NoWrap"
                           Style="{StaticResource HardwareBlackTextShadow}"/>
-               <TextBlock x:Name="TempValue" Text="—" FontSize="24"
+               <TextBlock x:Name="TempValue" Text="&#x2014;" FontSize="24"
                          FontWeight="Bold" VerticalAlignment="Center" TextWrapping="NoWrap"/>
               </Grid>
               <Border Grid.Column="1" Background="#38443A2E" Padding="9,4"
                       CornerRadius="9" VerticalAlignment="Center" Margin="8,0,0,0">
                <Grid>
 
-  <TextBlock x:Name="TempBadge" Text="—" FontSize="9.5"
+  <TextBlock x:Name="TempBadge" Text="&#x2014;" FontSize="9.5"
                            FontWeight="Bold" Foreground="#FFB476" TextWrapping="NoWrap"/>
                </Grid>
               </Border>
@@ -3125,7 +3238,7 @@ $script:Config = @{
        </Grid>
 
        <!-- Health / Storage / Network -->
-       <Grid Grid.Row="4">
+       <Grid x:Name="HomeEntranceStatusRow" Grid.Row="4" Opacity="0">
         <Grid.ColumnDefinitions>
          <ColumnDefinition Width="1.2*"/>
          <ColumnDefinition Width="10"/>
@@ -3172,7 +3285,7 @@ $script:Config = @{
                  <Path.Effect><DropShadowEffect Color="{Binding Stroke.Color, ElementName=HealthArc}"
                                BlurRadius="12" ShadowDepth="0" Opacity="0.90"/></Path.Effect>
                 </Path>
-                <TextBlock Text="—" FontSize="22" FontWeight="Bold" Foreground="#F5F5F7"
+                <TextBlock Text="&#x2014;" FontSize="22" FontWeight="Bold" Foreground="#F5F5F7"
                            HorizontalAlignment="Center" VerticalAlignment="Center" TextAlignment="Center"
                            x:Name="HealthValue"/>
                </Grid>
@@ -3182,13 +3295,13 @@ $script:Config = @{
               <TextBlock Text="CONNECTING" Foreground="#0A84FF" FontWeight="Bold"
                          FontSize="11.5" ToolTipService.IsEnabled="True" x:Name="HealthState"
                          TextWrapping="NoWrap" TextTrimming="CharacterEllipsis"/>
-              <TextBlock Text="Temperature —" Foreground="#A1A1A6" FontSize="12"
+              <TextBlock Text="Temperature &#x2014;" Foreground="#A1A1A6" FontSize="12"
                          Margin="0,9,0,0" ToolTipService.IsEnabled="True" x:Name="HealthOne"
                          TextWrapping="NoWrap" TextTrimming="CharacterEllipsis"/>
-              <TextBlock Text="Memory —" Foreground="#A1A1A6" FontSize="12"
+              <TextBlock Text="Memory &#x2014;" Foreground="#A1A1A6" FontSize="12"
                          Margin="0,8,0,0" ToolTipService.IsEnabled="True" x:Name="HealthTwo"
                          TextWrapping="NoWrap" TextTrimming="CharacterEllipsis"/>
-              <TextBlock Text="Disk / errors —" Foreground="#A1A1A6" FontSize="12"
+              <TextBlock Text="Disk / errors &#x2014;" Foreground="#A1A1A6" FontSize="12"
                          Margin="0,8,0,0" ToolTipService.IsEnabled="True" x:Name="HealthThree"
                          TextWrapping="NoWrap" TextTrimming="CharacterEllipsis"/>
              </StackPanel>
@@ -3219,26 +3332,26 @@ $script:Config = @{
            <StackPanel>
             <TextBlock Text="NETWORK" FontSize="15" Foreground="#F5F5F7" x:Name="NetHeading" FontWeight="Bold"/>
             <TextBlock FontSize="27" Foreground="#F4F6FF" FontWeight="Bold" Margin="0,7,0,7"
-                       x:Name="NetPing" Text="—"/>
+                       x:Name="NetPing" Text="&#x2014;"/>
             <UniformGrid Columns="3">
              <Border Style="{StaticResource Icon}" Padding="5,7" Margin="0,0,5,0">
               <StackPanel>
-               <TextBlock Text="↓ DOWN" Style="{StaticResource Label}" FontSize="9" FontWeight="Bold"/>
-               <TextBlock Text="—" FontSize="11" Foreground="#E6EDFC" FontWeight="SemiBold" Margin="0,5,0,0" x:Name="NetDown"
+               <TextBlock Text="&#x2193; DOWN" Style="{StaticResource Label}" FontSize="9" FontWeight="Bold"/>
+               <TextBlock Text="&#x2014;" FontSize="11" Foreground="#E6EDFC" FontWeight="SemiBold" Margin="0,5,0,0" x:Name="NetDown"
                           TextWrapping="NoWrap" TextTrimming="CharacterEllipsis"/>
               </StackPanel>
              </Border>
              <Border Style="{StaticResource Icon}" Padding="5,7" Margin="0,0,5,0">
               <StackPanel>
-               <TextBlock Text="↑ UP" Style="{StaticResource Label}" FontSize="9" FontWeight="Bold"/>
-               <TextBlock Text="—" FontSize="11" Foreground="#E6EDFC" FontWeight="SemiBold" Margin="0,5,0,0" x:Name="NetUp"
+               <TextBlock Text="&#x2191; UP" Style="{StaticResource Label}" FontSize="9" FontWeight="Bold"/>
+               <TextBlock Text="&#x2014;" FontSize="11" Foreground="#E6EDFC" FontWeight="SemiBold" Margin="0,5,0,0" x:Name="NetUp"
                           TextWrapping="NoWrap" TextTrimming="CharacterEllipsis"/>
               </StackPanel>
              </Border>
              <Border Style="{StaticResource Icon}" Padding="5,7">
               <StackPanel>
                <TextBlock Text="JITTER" Style="{StaticResource Label}" FontSize="9" FontWeight="Bold"/>
-               <TextBlock Text="—" FontSize="11" Foreground="#E6EDFC" FontWeight="SemiBold" Margin="0,5,0,0" ToolTip="Mean change between consecutive ping replies (up to 10 samples)." x:Name="NetJitter"
+               <TextBlock Text="&#x2014;" FontSize="11" Foreground="#E6EDFC" FontWeight="SemiBold" Margin="0,5,0,0" ToolTip="Mean change between consecutive ping replies (up to 10 samples)." x:Name="NetJitter"
                           TextWrapping="NoWrap" TextTrimming="CharacterEllipsis"/>
               </StackPanel>
              </Border>
@@ -3252,7 +3365,7 @@ $script:Config = @{
        <!-- Specifications: static frosted five-field spec rail; no hover. -->
        <Border Style="{StaticResource GlassLift}" Grid.Row="6"/>
 
-       <Border Style="{StaticResource CardStatic}" Padding="7,8" Grid.Row="6" Tag="FrostedStaticCard">
+       <Border x:Name="HomeEntranceSpecs" Style="{StaticResource CardStatic}" Padding="7,8" Grid.Row="6" Opacity="0" Tag="FrostedStaticCard">
         <UniformGrid Columns="5" Margin="0,0,0,0">
          <Border BorderThickness="0,0,1,0" BorderBrush="#12DCE5F7" Padding="8,0,8,0">
           <StackPanel VerticalAlignment="Center" HorizontalAlignment="Stretch">
@@ -3263,7 +3376,7 @@ $script:Config = @{
                        FontSize="9.5" FontWeight="Bold" TextWrapping="NoWrap"
                        VerticalAlignment="Center"/>
            </StackPanel>
-           <TextBlock x:Name="SpecCpu" Text="—" TextAlignment="Center" HorizontalAlignment="Stretch" FontSize="11.5" FontWeight="SemiBold"
+           <TextBlock x:Name="SpecCpu" Text="&#x2014;" TextAlignment="Center" HorizontalAlignment="Stretch" FontSize="11.5" FontWeight="SemiBold"
                       Foreground="#E7EAF5" Margin="0,10,0,0" TextWrapping="NoWrap"
                       TextTrimming="None"/>
           </StackPanel>
@@ -3277,7 +3390,7 @@ $script:Config = @{
                        FontSize="9.5" FontWeight="Bold" TextWrapping="NoWrap"
                        VerticalAlignment="Center"/>
            </StackPanel>
-           <TextBlock x:Name="SpecGpu" Text="—" TextAlignment="Center" HorizontalAlignment="Stretch" FontSize="11.5" FontWeight="SemiBold"
+           <TextBlock x:Name="SpecGpu" Text="&#x2014;" TextAlignment="Center" HorizontalAlignment="Stretch" FontSize="11.5" FontWeight="SemiBold"
                       Foreground="#E7EAF5" Margin="0,10,0,0" TextWrapping="NoWrap"
                       TextTrimming="None"/>
           </StackPanel>
@@ -3291,7 +3404,7 @@ $script:Config = @{
                        FontSize="9.5" FontWeight="Bold" TextWrapping="NoWrap"
                        VerticalAlignment="Center"/>
            </StackPanel>
-           <TextBlock x:Name="SpecRam" Text="—" TextAlignment="Center" HorizontalAlignment="Stretch" FontSize="11.5" FontWeight="SemiBold"
+           <TextBlock x:Name="SpecRam" Text="&#x2014;" TextAlignment="Center" HorizontalAlignment="Stretch" FontSize="11.5" FontWeight="SemiBold"
                       Foreground="#E7EAF5" Margin="0,10,0,0" TextWrapping="NoWrap"
                       TextTrimming="None"/>
           </StackPanel>
@@ -3305,7 +3418,7 @@ $script:Config = @{
                        FontSize="9.5" FontWeight="Bold" TextWrapping="NoWrap"
                        VerticalAlignment="Center"/>
            </StackPanel>
-           <TextBlock x:Name="SpecBoard" Text="—" TextAlignment="Center" HorizontalAlignment="Stretch" FontSize="11.5" FontWeight="SemiBold"
+           <TextBlock x:Name="SpecBoard" Text="&#x2014;" TextAlignment="Center" HorizontalAlignment="Stretch" FontSize="11.5" FontWeight="SemiBold"
                       Foreground="#E7EAF5" Margin="0,10,0,0" TextWrapping="NoWrap"
                       TextTrimming="None"/>
           </StackPanel>
@@ -3319,7 +3432,7 @@ $script:Config = @{
                        FontSize="9.5" FontWeight="Bold" TextWrapping="NoWrap"
                        VerticalAlignment="Center"/>
            </StackPanel>
-           <TextBlock x:Name="SpecOS" Text="—" TextAlignment="Center" HorizontalAlignment="Stretch" FontSize="11.5" FontWeight="SemiBold"
+           <TextBlock x:Name="SpecOS" Text="&#x2014;" TextAlignment="Center" HorizontalAlignment="Stretch" FontSize="11.5" FontWeight="SemiBold"
                       Foreground="#E7EAF5" Margin="0,10,0,0" TextWrapping="NoWrap"
                       TextTrimming="None"/>
           </StackPanel>
@@ -3329,7 +3442,7 @@ $script:Config = @{
 
        <TextBlock Text="" Foreground="#76899A" FontSize="9" x:Name="ProviderStatus" Grid.Row="8" Visibility="Collapsed"/>
        </Grid>
-       <!-- Empty placeholder for FPS TWEAK / LATENCY / NETWORK / CLEAN UP.
+       <!-- Empty placeholder for PC TUNE / LATENCY / NETWORK / CLEAN UP.
             The shared window background stays visible, with no modal popup. -->
        <Grid x:Name="BlankPage" Visibility="Collapsed" Background="Transparent"/>
       </Grid>
@@ -3696,40 +3809,75 @@ function Set-CardHoverLift($card, [bool]$raised) {
     $move.BeginAnimation($property, $motion, [Windows.Media.Animation.HandoffBehavior]::SnapshotAndReplace)
 }
 
-function Initialize-CardShadows {
-    if ($script:CardShadowsInitialized) { return }
-    $script:CardShadowsInitialized = $true
+# Initialize costly visual-tree shadow wiring in small dispatcher batches.
+# Keeps every card/shadow/hover feature while allowing render and input between
+# slices (especially on the first launch and the first return to HOME).
+$script:CardShadowWork = $null
+$script:CardShadowWorkPaused = $false
+function Invoke-ScriptXCardShadowBatch {
+    if ($state.Closing -or $null -eq $script:CardShadowWork) { return }
+    # Never mutate WPF card visual trees during the active HOME reveal.
+    if ($script:HomeEntranceActive) {
+        $script:CardShadowWorkPaused = $true
+        return
+    }
     try {
-        $style = $window.FindResource('GlassLift')
-        $hoverStyle = $window.FindResource('CardHoverHost')
-        $stack = New-Object 'System.Collections.Generic.Stack[System.Windows.DependencyObject]'
-        $stack.Push($window)
-        while ($stack.Count -gt 0) {
-            $node = $stack.Pop()
+        $work = $script:CardShadowWork
+        $countDone = 0
+        while ($work.Stack.Count -gt 0 -and $countDone -lt 18) {
+            $node = $work.Stack.Pop()
+            $countDone++
             if ($node -is [Windows.Controls.ContentControl] -and
-                [object]::ReferenceEquals($node.Style, $hoverStyle)) {
+                [object]::ReferenceEquals($node.Style, $work.HoverStyle)) {
                 $node.Add_MouseEnter({ param($sender, $e) Set-CardHoverLift $sender $true })
                 $node.Add_MouseLeave({ param($sender, $e) Set-CardHoverLift $sender $false })
                 if ($node.IsMouseOver) { Set-CardHoverLift $node $true }
             }
             if ($node -is [Windows.Controls.Border] -and
-                [object]::ReferenceEquals($node.Style, $style)) {
+                [object]::ReferenceEquals($node.Style, $work.GlassStyle)) {
                 Set-CardShadowClip $node
                 $node.Add_SizeChanged({ param($sender, $args) Set-CardShadowClip $sender })
                 $caster = [Windows.Controls.Border]::new()
                 $caster.CornerRadius = $node.CornerRadius
                 $caster.Background = [Windows.Media.Brushes]::Black
-                $caster.Effect = $window.FindResource('CardOuterShadow')
+                $caster.Effect = $work.OuterShadow
                 $node.Child = $caster
             }
             $count = [Windows.Media.VisualTreeHelper]::GetChildrenCount($node)
             for ($i = 0; $i -lt $count; $i++) {
-                $stack.Push([Windows.Media.VisualTreeHelper]::GetChild($node, $i))
+                $work.Stack.Push([Windows.Media.VisualTreeHelper]::GetChild($node, $i))
             }
+        }
+        if ($work.Stack.Count -gt 0) {
+            [void]$window.Dispatcher.BeginInvoke([Action]{
+                Invoke-ScriptXCardShadowBatch
+            }, [Windows.Threading.DispatcherPriority]::ContextIdle)
+        } else {
+            $script:CardShadowWork = $null
         }
     }
     catch {
-        Write-HsStartupLog ('GLASS_LIFT_INIT_FALLBACK: ' + ($_ | Out-String))
+        $script:CardShadowWork = $null
+        Write-HsStartupLog ('GLASS_LIFT_INIT_FALLBACK: ' + ($_.Exception.Message))
+    }
+}
+function Initialize-CardShadows {
+    if ($script:CardShadowsInitialized) { return }
+    $script:CardShadowsInitialized = $true
+    try {
+        $stack = New-Object 'System.Collections.Generic.Stack[System.Windows.DependencyObject]'
+        $stack.Push($window)
+        $script:CardShadowWork = [pscustomobject]@{
+            Stack       = $stack
+            GlassStyle  = $window.FindResource('GlassLift')
+            HoverStyle  = $window.FindResource('CardHoverHost')
+            OuterShadow = $window.FindResource('CardOuterShadow')
+        }
+        Invoke-ScriptXCardShadowBatch
+    }
+    catch {
+        $script:CardShadowWork = $null
+        Write-HsStartupLog ('GLASS_LIFT_INIT_FALLBACK: ' + ($_.Exception.Message))
     }
 }
 
@@ -3776,9 +3924,13 @@ catch { Write-HsStartupLog ('DWM_HELPER_SKIPPED: ' + $_.Exception.Message) }
 # Suspend only the on-screen meter animator while minimized; independent
 # genuine FPS telemetry collection continues unchanged.
 $script:LastHealthResult=$null
+$script:LastRenderedHealthStamp = [datetime]::MinValue
 $script:LastHealthRequestMs=[double]::NegativeInfinity
 $window.Add_StateChanged({
     if ($window.WindowState -eq [Windows.WindowState]::Minimized) {
+        # A minimized window can suspend WPF timeline clocks. Clear the HOME
+        # entrance flag so fresh telemetry never stays deferred indefinitely.
+        if ($script:HomeEntranceActive) { Stop-ScriptXHomeEntrance }
         if ($null -ne $script:FpsFramePresenter) {
             $script:FpsFramePresenter.SetVisible($false)
         }
@@ -3789,7 +3941,7 @@ $window.Add_StateChanged({
             $script:FpsFramePresenter.SetVisible([bool](
                 $ui.HomePage.Visibility -eq [Windows.Visibility]::Visible))
         }
-        Restore-HealthView
+        Request-ScriptXHomeRefresh
         if ($fpsFallbackTimer) {
             $script:LastFpsFallbackFrame = [datetime]::UtcNow
             $fpsFallbackTimer.Start()
@@ -3797,7 +3949,33 @@ $window.Add_StateChanged({
     }
 })
 
-$window.Add_Activated({ if ($script:UiInitialized) { Restore-HealthView } })
+$script:HomeRefreshQueued = $false
+function Request-ScriptXHomeRefresh {
+    if ($script:HomeRefreshQueued -or $state.Closing) { return }
+    if (-not $ui.HomePage.IsVisible -or
+        $window.WindowState -eq [Windows.WindowState]::Minimized) { return }
+    $script:HomeRefreshQueued = $true
+    try {
+        [void]$window.Dispatcher.BeginInvoke([Action]{
+            $script:HomeRefreshQueued = $false
+            if ($state.Closing -or -not $ui.HomePage.IsVisible -or
+                $window.WindowState -eq [Windows.WindowState]::Minimized) { return }
+            # While the HOME card groups reveal, defer only UI text updates.
+            # Data collection continues unmodified in its worker runspace.
+            if ($script:HomeEntranceActive) { return }
+            # Show only a newer REAL worker snapshot that arrived on a blank page.
+            if ($state.Latest -and
+                $state.Latest.Timestamp -ne $script:LastRenderedTelemetryStamp) {
+                Show-Reading $state.Latest
+            }
+            if ($script:LastHealthResult) { Restore-HealthView }
+        }, [Windows.Threading.DispatcherPriority]::Background)
+    }
+    catch { $script:HomeRefreshQueued = $false }
+}
+$window.Add_Activated({
+    if ($script:UiInitialized) { Request-ScriptXHomeRefresh }
+})
 
 $frameContent.Add_SizeChanged({
     $w = [math]::Max(0, $frameContent.ActualWidth)
@@ -3877,6 +4055,7 @@ $meterReadingProperty = [Windows.Controls.Canvas]::LeftProperty
 $meterReadingPath = [Windows.PropertyPath]::new('(0)', [object[]]@($meterReadingProperty))
 $meterSampleClock = [Diagnostics.Stopwatch]::StartNew()
 $script:LastMeterSampleMs = $null
+$script:LastRenderedTelemetryStamp = [datetime]::MinValue
 $script:MeterTravelMs = [double]$script:Config.RefreshMs
 $script:LastFpsFallbackFrame = [datetime]::UtcNow
 $script:FpsFallbackDeltaSeconds = 0.033
@@ -3887,7 +4066,7 @@ function Format-Percent($Value) {
 }
 
 function Format-Rate($Value) {
-    if ($null -eq $Value) { return '—' }
+    if ($null -eq $Value) { return $script:DisplayDash }
     if ($Value -ge 1MB) { return ('{0:0.0} MB/s' -f ($Value / 1MB)) }
     if ($Value -ge 1KB) { return ('{0:0} KB/s' -f ($Value / 1KB)) }
     '{0:0} B/s' -f $Value
@@ -3918,7 +4097,7 @@ function Set-Meter([string]$Name, $Value) {
         $binding.Source = $bar
         $binding.Path = $meterReadingPath
         $binding.Mode = [Windows.Data.BindingMode]::OneWay
-        $binding.StringFormat = if ($Name -eq 'Temp') { '{0:0.0}°C' } else { '{0:0.0}%' }
+        $binding.StringFormat = if ($Name -eq 'Temp') { ('{0:0.0}' + $script:DisplayDegree + 'C') } else { '{0:0.0}%' }
         [void]$text.SetBinding($labelProperty, $binding)
         $fillProperty = [Windows.Controls.Primitives.RangeBase]::ValueProperty
         if (-not $bar.GetBindingExpression($fillProperty)) {
@@ -4002,7 +4181,7 @@ function Select-DisplayGpu($Data) {
 function Get-CompactModelLabel {
     param([string]$Name, [string]$Kind = 'Device')
     if ([string]::IsNullOrWhiteSpace($Name)) { return 'NOT DETECTED' }
-    $clean = ($Name -replace '(?i)\(R\)|\(TM\)|[®™]', '' -replace '\s+', ' ').Trim()
+    $clean = ($Name -replace '(?i)\(R\)|\(TM\)|[\u00AE\u2122]', '' -replace '\s+', ' ').Trim()
     if ($Kind -eq 'Cpu') {
         $part = [regex]::Match($clean, '(?i)\b(?:i[3579]-\d{4,5}[A-Z]*|Core Ultra\s+\d{3}[A-Z]*|Ryzen\s+\d+\s+\d+[A-Z0-9]*)\b')
         if ($part.Success) {
@@ -4052,12 +4231,16 @@ function Show-Gpu($Gpu) {
 }
 
 function Show-Disks($Disks) {
-    $key = $Disks | ConvertTo-Json -Compress
+    # Fingerprint only visible properties; never rebuild child controls when
+    # unrelated volume metadata changes in the background provider.
+    $all = @($Disks)
+    $key = ($all | ForEach-Object {
+        '{0}|{1}|{2:0}' -f $_.Name, $_.Label, [double]$_.UsedPercent
+    }) -join ';' 
     if ($state.DiskKey -eq $key) { return }
 
     $state.DiskKey = $key
     $ui.Storage.Children.Clear()
-    $all = @($Disks)
 
     foreach ($disk in $all | Select-Object -First 3) {
         $box = New-Object Windows.Controls.Border
@@ -4115,7 +4298,7 @@ function Clear-HealthRing {
     $arc.BeginAnimation($meterReadingProperty, $null)
     $arc.BeginAnimation([Windows.Shapes.Shape]::StrokeDashOffsetProperty, $null)
     $arc.SetValue($meterReadingProperty, 0.0)
-    $ui.HealthValue.Text = '—'
+    $ui.HealthValue.Text = $script:DisplayDash
 }
 
 function Set-HealthRing([double]$score, [switch]$Immediate) {
@@ -4159,12 +4342,13 @@ function Set-HealthRing([double]$score, [switch]$Immediate) {
 }
 
 function Reset-SystemHealth([string]$reason) {
+    $script:LastRenderedHealthStamp = [datetime]::MinValue
     Clear-HealthRing
     $ui.HealthState.Text = $reason
     $ui.HealthState.Foreground = '#9FB4C5'
-    $ui.HealthOne.Text = 'Temperature —'
-    $ui.HealthTwo.Text = 'Memory —'
-    $ui.HealthThree.Text = 'Disk / HW —'
+    $ui.HealthOne.Text = ('Temperature ' + $script:DisplayDash)
+    $ui.HealthTwo.Text = ('Memory ' + $script:DisplayDash)
+    $ui.HealthThree.Text = ('Disk / HW ' + $script:DisplayDash)
     foreach ($row in @($ui.HealthOne, $ui.HealthTwo, $ui.HealthThree)) {
         $row.ToolTip = $null
     }
@@ -4176,15 +4360,18 @@ function Update-SystemHealth($result, [switch]$Immediate) {
     if (-not $result) { Reset-SystemHealth 'INSUFFICIENT DATA'; return }
     $age=([datetime]::UtcNow-$result.Timestamp).TotalSeconds
     if ($age -lt 0 -or $age -gt 15) {Reset-SystemHealth 'STALE DATA'; return}
+    # Identical snapshots need no repeated WPF tooltip layout or arc work.
+    if ($script:LastRenderedHealthStamp -eq $result.Timestamp) { return }
+    $script:LastRenderedHealthStamp = $result.Timestamp
     $c=$result.Categories
-    $lines=@("Estimated operating health · $($result.Timestamp.ToLocalTime().ToString('HH:mm:ss'))",
+    $lines=@("Estimated operating health $($script:DisplayDot) $($result.Timestamp.ToLocalTime().ToString('HH:mm:ss'))",
         "Estimated operational risk: thermal 30%, memory 20%, storage 30%, WHEA 20%; severity-based. Missing checks never count as healthy. Incomplete evidence limits the display to 95% (confidence cap), not diagnosed damage.",
-        "Scored domains: $($result.DataCoverage) · complete: $($result.CompleteDomains)/4 · confidence: $($result.Confidence)")
+        "Scored domains: $($result.DataCoverage) $($script:DisplayDot) complete: $($result.CompleteDomains)/4 $($script:DisplayDot) confidence: $($result.Confidence)")
     foreach ($domain in $c.Values) {
         $sampleTime=if ($domain.Timestamp -and $domain.Timestamp -gt [datetime]::MinValue) {
             $domain.Timestamp.ToLocalTime().ToString('HH:mm:ss')
         } else { 'no sample' }
-        $lines += "$($domain.Name) · $($domain.Status) · $sampleTime · $($domain.Reason)"
+        $lines += "$($domain.Name) $($script:DisplayDot) $($domain.Status) $($script:DisplayDot) $sampleTime $($script:DisplayDot) $($domain.Reason)"
     }
     $ui.HealthState.ToolTip=$lines -join [environment]::NewLine
     $ui.HealthOne.ToolTip = @($c.Thermal.Reason,$c.Thermal.Observations) -join [environment]::NewLine
@@ -4196,7 +4383,7 @@ function Update-SystemHealth($result, [switch]$Immediate) {
                 $val=$row.Reliability.$field
                 if ($null -ne $val) {"$field=$val"}
             })
-            if ($values.Count) {$diskInfo+="$($row.Name) · cumulative: $($values -join ', ')"}
+            if ($values.Count) {$diskInfo+="$($row.Name) $($script:DisplayDot) cumulative: $($values -join ', ')"}
         }
     }
     $ui.HealthThree.ToolTip=$diskInfo -join [environment]::NewLine
@@ -4207,27 +4394,27 @@ function Update-SystemHealth($result, [switch]$Immediate) {
             foreach ($ch in $c.Thermal.Details) {
                 if ($ch.Kind -eq $type -and $null -ne $ch.Value -and $ch.Value -ge -30 -and $ch.Value -le 160 -and ($null -eq $peak -or $ch.Value -gt $peak)) {$peak=$ch.Value}
             }
-            if ($null -eq $peak) {$visibleTemps+=('{0} —' -f $type.Substring(0,3))}
-            else {$visibleTemps+=('{0} {1:0}°' -f $type.Substring(0,3),$peak)}
+            if ($null -eq $peak) {$visibleTemps += (('{0} ' -f $type.Substring(0,3)) + $script:DisplayDash)}
+            else {$visibleTemps += (('{0} {1:0}' -f $type.Substring(0,3),$peak) + $script:DisplayDegree)}
         }
     }
     if (-not $visibleTemps.Count -and $c.Thermal.Status -eq 'Unavailable') {
         $hot=$c.Thermal.Details | Where-Object Kind -eq 'GPU Hotspot' | Sort-Object Value -Descending | Select-Object -First 1
-        if ($hot) {$visibleTemps+=('Hotspot {0:0}°' -f $hot.Value)}
+        if ($hot) {$visibleTemps += (('Hotspot {0:0}' -f $hot.Value) + $script:DisplayDegree)}
     }
-    $ui.HealthOne.Text = if ($visibleTemps.Count) {$visibleTemps -join ' / '} else {"Temp · $($c.Thermal.Status)"}
+    $ui.HealthOne.Text = if ($visibleTemps.Count) {$visibleTemps -join ' / '} else {"Temp $($script:DisplayDot) $($c.Thermal.Status)"}
     $ui.HealthTwo.Text = if ($c.Memory.Pressure -eq 'Normal' -and $null -ne $c.Memory.Details.Commit) {
         'Commit {0:0}%' -f $c.Memory.Details.Commit
-    } elseif ($c.Memory.Pressure) {"RAM · $($c.Memory.Pressure)"} else {"RAM · $($c.Memory.Status)"}
+    } elseif ($c.Memory.Pressure) {"RAM $($script:DisplayDot) $($c.Memory.Pressure)"} else {"RAM $($script:DisplayDot) $($c.Memory.Status)"}
     $short=@{Available='OK';Unavailable='?';Stale='stale';Critical='FAIL';Warning='warn'}
     $diskLabel=if ($c.Storage.Status -eq 'Available' -and -not $c.Storage.Complete) {'partial'} else {$short[$c.Storage.Status]}
     $hwLabel=$short[$c.WHEA.Status]
     if ($c.WHEA.Status -eq 'Available') {
         foreach ($evt in $c.WHEA.Details) {if ($evt.Class -eq 'Corrected') {$hwLabel='corr.';break}}
     }
-    $ui.HealthThree.Text = "Disk $diskLabel · HW $hwLabel"
+    $ui.HealthThree.Text = "Disk $diskLabel $($script:DisplayDot) HW $hwLabel"
     $label=$result.Status
-    if ($result.Confidence -ne 'High' -and $null -ne $result.Score) {$label+=" · EST $($result.DataCoverage)"}
+    if ($result.Confidence -ne 'High' -and $null -ne $result.Score) {$label+=" $($script:DisplayDot) EST $($result.DataCoverage)"}
     if ($result.Status -eq 'INSUFFICIENT DATA') {$label="DATA $($result.DataCoverage)"}
     $ui.HealthState.Text=$label
     $color=switch ($result.Status) {
@@ -4244,10 +4431,10 @@ function Show-NetworkReading($n) {
     $ui.NetPing.ToolTip = if ($n.PingTarget) { "ICMP round trip to $($n.PingTarget) via $($n.Name)" } else { 'No ping destination available' }
     $ui.NetPing.Text = if ($null -ne $n.Ping) {
         if ($n.Ping -eq 0) { '<1 ms' } else { '{0:0} ms' -f $n.Ping }
-    } elseif ($null -eq $n) { '—' } elseif (-not $n.Connected) { 'Offline' } elseif ($n.PingTarget) { 'No reply' } else { 'N/A' }
+    } elseif ($null -eq $n) { $script:DisplayDash } elseif (-not $n.Connected) { 'Offline' } elseif ($n.PingTarget) { 'No reply' } else { 'N/A' }
     $ui.NetDown.Text = Format-Rate $n.DownBps
     $ui.NetUp.Text = Format-Rate $n.UpBps
-    $ui.NetJitter.Text = if ($null -ne $n.Jitter) { '{0:0.0} ms' -f $n.Jitter } else { '—' }
+    $ui.NetJitter.Text = if ($null -ne $n.Jitter) { '{0:0.0} ms' -f $n.Jitter } else { $script:DisplayDash }
 }
 
 # SHOW SPEC ONLY: compact, model-preserving identifiers for the five-field rail.
@@ -4261,7 +4448,7 @@ function Add-ShowSpecOption($Options, [string]$Value) {
 function Get-ShowSpecOptions([string]$Raw, [string]$Kind) {
     $options = New-Object 'System.Collections.Generic.List[string]'
     if ([string]::IsNullOrWhiteSpace($Raw)) { return @('Unavailable') }
-    $name = ($Raw -replace '(?i)\((?:R|TM)\)|[®™]', '' -replace '\s+', ' ').Trim()
+    $name = ($Raw -replace '(?i)\((?:R|TM)\)|[\u00AE\u2122]', '' -replace '\s+', ' ').Trim()
     switch ($Kind) {
         'Cpu' {
             $found = [regex]::Match($name, '(?i)\b(?:Core\s+)?Ultra\s+[3579]\s+\d{2,4}[A-Z0-9]*\b')
@@ -4418,7 +4605,7 @@ function Update-ShowSpec($Data, $DisplayGpu) {
     if ($ramGb -gt 0) {
         $memoryOptions = @()
         if ($ramSpeed -ge 200 -and $ramSpeed -le 20000) {
-            $memoryOptions += ('{0:0.#} GB · {1:0} MT/s' -f $ramGb, $ramSpeed)
+            $memoryOptions += (('{0:0.#} GB ' + $script:DisplayDot + ' {1:0} MT/s') -f $ramGb, $ramSpeed)
         }
         $memoryOptions += ('{0:0.#} GB RAM' -f $ramGb)
         $memoryOptions += ('{0:0.#} GB' -f $ramGb)
@@ -4445,10 +4632,10 @@ function Show-Reading($d) {
     $state.LastGood = Get-Date
 
     $ui.Connection.Text = if ($d.OS -and $null -ne $d.Cpu) {
-        '● LIVE SYSTEM OVERVIEW'
+        ($script:DisplayBullet + ' LIVE SYSTEM OVERVIEW')
     }
     else {
-        '● SOME SOURCES UNAVAILABLE'
+        ($script:DisplayBullet + ' SOME SOURCES UNAVAILABLE')
     }
 
 
@@ -4484,9 +4671,12 @@ function Show-Reading($d) {
 
     Show-NetworkReading $d.Network
 
+    # Update-ShowSpec already fingerprints PC inventory and skips unchanged
+    # text/layout; keep instant detection when hardware first becomes available.
     Update-ShowSpec $d $displayGpu
 
-    $ui.ProfileStatus.Text = if ($complete) { '● CONNECTED' } else { '● PARTIAL DATA' }
+    $script:LastRenderedTelemetryStamp = $d.Timestamp
+    $ui.ProfileStatus.Text = if ($complete) { ($script:DisplayBullet + ' CONNECTED') } else { ($script:DisplayBullet + ' PARTIAL DATA') }
     $ui.ProviderStatus.Text = ''
 
 }
@@ -5818,6 +6008,8 @@ function Restore-HealthView {
 
 function Start-Reading {
     if ($state.Closing -or $null -ne $state.Pending) { return }
+    if (-not $ui.HomePage.IsVisible -or
+        $window.WindowState -eq [Windows.WindowState]::Minimized) { return }
 
     $state.Started = Get-Date
     $worker.Commands.Clear()
@@ -5846,108 +6038,262 @@ $ui.Minimize.Add_Click({
     $window.WindowState = [Windows.WindowState]::Minimized
 })
 
-# Shared, composited Fade In + rise entrance for every content destination.
-# Attach to ContentPages, not HomePage, so upcoming categories inherit it.
-# Animation clocks run in WPF; no PowerShell per-frame polling/timer.
-$script:PageContentSurface = $window.FindName('ContentPages')
-$script:PageContentOffset = [Windows.Media.TranslateTransform]::new(0.0, 0.0)
-$script:PageContentSurface.RenderTransform = $script:PageContentOffset
-$script:PageContentSurface.Opacity = 1.0
+# HOME-specific entrance: stagger individual *existing* visual groups.
+# Do not fade the entire HomePage/window, whose large GPU shadow/render tree
+# forces whole-page re-compositing and obscures the intended UI fade.
+# Each timeline is WPF-driven, never a PowerShell per-frame callback/timer.
+$script:HomeEntranceGroups = @(
+    'HomeEntranceHeader', 'PerformanceRow',
+    'HomeEntranceStatusRow', 'HomeEntranceSpecs'
+)
+$script:HomeEntranceOffsets = @{}
+foreach ($groupName in $script:HomeEntranceGroups) {
+    $offset = [Windows.Media.TranslateTransform]::new(0.0, 0.0)
+    $ui[$groupName].RenderTransform = $offset
+    $script:HomeEntranceOffsets[$groupName] = $offset
+}
 $script:SelectedScriptXPage = $null
-function Start-ScriptXPageEntrance {
+$script:HomeEntranceActive = $false
+$script:HomeVisualServicesScheduled = $false
+
+function Resume-ScriptXCardShadowBatch {
+    if ($state.Closing -or -not $script:CardShadowWorkPaused -or
+        $null -eq $script:CardShadowWork) { return }
+    $script:CardShadowWorkPaused = $false
+    [void]$window.Dispatcher.BeginInvoke([Action]{
+        Invoke-ScriptXCardShadowBatch
+    }, [Windows.Threading.DispatcherPriority]::ContextIdle)
+}
+function Start-ScriptXHomeVisualServices {
+    if ($state.Closing -or -not $script:UiInitialized) { return }
+    if ($script:HomeVisualServicesScheduled) {
+        if (-not $script:HomeEntranceActive) { Resume-ScriptXCardShadowBatch }
+        return
+    }
+    $script:HomeVisualServicesScheduled = $true
+    # Costly shadow tree traversal and effect setup is not allowed to compete
+    # with first-entrance WPF animations. Resume it at idle after the reveal.
+    [void]$window.Dispatcher.BeginInvoke([Action]{
+        if ($state.Closing) { return }
+        try {
+            Initialize-CardShadows
+            if (-not $script:MeterGlowInitialized) {
+                Initialize-MeterGlow
+                $script:MeterGlowInitialized = $true
+            }
+        }
+        catch { Write-HsStartupLog ('VISUAL_STARTUP_FAILED: ' + $_.Exception.Message) }
+    }, [Windows.Threading.DispatcherPriority]::ContextIdle)
+}
+function Stop-ScriptXHomeEntrance {
+    $script:HomeEntranceActive = $false
+    foreach ($groupName in $script:HomeEntranceGroups) {
+        try {
+            $element = $ui[$groupName]
+            $move = $script:HomeEntranceOffsets[$groupName]
+            $element.BeginAnimation([Windows.UIElement]::OpacityProperty, $null)
+            $move.BeginAnimation([Windows.Media.TranslateTransform]::YProperty, $null)
+            # Fully opaque static HOME content between transitions.
+            $element.Opacity = 1.0
+            $move.Y = 0.0
+        }
+        catch { }
+    }
+}
+# Build both entrance timelines ONCE before window.ShowDialog() so neither
+# first paint nor repeated HOME visits allocates keyframes/easings in a click.
+$script:HomeEntranceClocks = @{}
+function Initialize-ScriptXHomeEntranceClocks {
+    foreach ($variant in @('Initial','Return')) {
+        $isInitial = $variant -eq 'Initial'
+        # Relaxed premium entrance: overlapping fades with a deliberate rhythm.
+        # Durations use compositor-owned WPF clocks, not a PowerShell frame timer.
+        $delays = if ($isInitial) { @(0, 95, 185, 280) } else { @(0, 75, 155, 235) }
+        $durationMs = if ($isInitial) { 860 } else { 760 }
+        $rise = if ($isInitial) { 36.0 } else { 30.0 }
+        $fadeClocks = New-Object 'System.Collections.Generic.List[System.Windows.Media.Animation.DoubleAnimationUsingKeyFrames]'
+        $shiftClocks = New-Object 'System.Collections.Generic.List[System.Windows.Media.Animation.DoubleAnimation]' 
+        for ($i = 0; $i -lt $script:HomeEntranceGroups.Count; $i++) {
+            $delayMs = [int]$delays[$i]
+            $finishMs = $delayMs + $durationMs
+            # 0% on the first frame, held until this row's stagger delay,
+            # then a genuine alpha fade to 100%, with no overlay and no flash.
+            $fade = [Windows.Media.Animation.DoubleAnimationUsingKeyFrames]::new()
+            $fade.FillBehavior = [Windows.Media.Animation.FillBehavior]::Stop
+            $fade.Duration = [Windows.Duration]::new([timespan]::FromMilliseconds($finishMs))
+            [void]$fade.KeyFrames.Add([Windows.Media.Animation.DiscreteDoubleKeyFrame]::new(
+                0.0, [Windows.Media.Animation.KeyTime]::FromTimeSpan([timespan]::Zero)))
+            if ($delayMs -gt 0) {
+                [void]$fade.KeyFrames.Add([Windows.Media.Animation.DiscreteDoubleKeyFrame]::new(
+                    0.0, [Windows.Media.Animation.KeyTime]::FromTimeSpan(
+                        [timespan]::FromMilliseconds($delayMs))))
+            }
+            # Smooth start AND finish; the old cubic EaseOut made most of the
+            # opacity change immediately, so it looked faster than its timing.
+            $ease = [Windows.Media.Animation.SineEase]::new()
+            $ease.EasingMode = [Windows.Media.Animation.EasingMode]::EaseInOut
+            $end = [Windows.Media.Animation.EasingDoubleKeyFrame]::new()
+            $end.Value = 1.0
+            $end.KeyTime = [Windows.Media.Animation.KeyTime]::FromTimeSpan(
+                [timespan]::FromMilliseconds($finishMs))
+            $end.EasingFunction = $ease
+            [void]$fade.KeyFrames.Add($end)
+            # One completion per variant, on the LAST (specs) fade only.
+            if ($i -eq ($script:HomeEntranceGroups.Count - 1)) {
+                $fade.Add_Completed({
+                    if ($state.Closing -or -not $script:HomeEntranceActive) { return }
+                    $script:HomeEntranceActive = $false
+                    Start-ScriptXHomeVisualServices
+                    Request-ScriptXHomeRefresh
+                })
+            } elseif ($fade.CanFreeze) { $fade.Freeze() }
+            $fadeClocks.Add($fade)
+
+            $shift = [Windows.Media.Animation.DoubleAnimation]::new()
+            $shift.From = $rise
+            $shift.To = 0.0
+            $shift.BeginTime = [timespan]::FromMilliseconds($delayMs)
+            $shift.Duration = [Windows.Duration]::new([timespan]::FromMilliseconds($durationMs))
+            $shift.FillBehavior = [Windows.Media.Animation.FillBehavior]::Stop
+            $shift.EasingFunction = $ease
+            if ($shift.CanFreeze) { $shift.Freeze() }
+            $shiftClocks.Add($shift)
+        }
+        $script:HomeEntranceClocks[$variant] = [pscustomobject]@{
+            Fades = $fadeClocks
+            Shifts = $shiftClocks
+        }
+    }
+}
+try { Initialize-ScriptXHomeEntranceClocks }
+catch { Write-HsStartupLog ('HOME_CLOCK_PREP_FALLBACK: ' + $_.Exception.Message) }
+
+function Start-ScriptXHomeEntrance {
     param([switch]$Initial)
-    if ($null -eq $script:PageContentSurface) { return }
+    if ($state.Closing -or
+        $ui.HomePage.Visibility -ne [Windows.Visibility]::Visible -or
+        $window.WindowState -eq [Windows.WindowState]::Minimized) { return }
     try {
-        $page = $script:PageContentSurface
-        $offset = $script:PageContentOffset
-        # Reset the old clocks on rapid category switches, keeping an opaque
-        # base/zero offset as a safe fallback if animation initialization fails.
-        $page.BeginAnimation([Windows.UIElement]::OpacityProperty, $null)
-        $offset.BeginAnimation([Windows.Media.TranslateTransform]::YProperty, $null)
-        $page.Opacity = 1.0
-        $offset.Y = 0.0
-
-        # Calm, slightly staggered composition: opacity grows through most of
-        # the rise rather than appearing instantly. WPF clocks do the work;
-        # no new DispatcherTimer and no CPU-side animation loop.
-        $durationMs = if ($Initial) { 850 } else { 740 }
-        $fadeDurationMs = if ($Initial) { 760 } else { 680 }
-        $startY = if ($Initial) { 27.0 } else { 23.0 }
-        $riseEase = New-Object Windows.Media.Animation.CubicEase
-        $riseEase.EasingMode = [Windows.Media.Animation.EasingMode]::EaseOut
-        $fadeEase = New-Object Windows.Media.Animation.SineEase
-        $fadeEase.EasingMode = [Windows.Media.Animation.EasingMode]::EaseInOut
-
-        $rise = New-Object Windows.Media.Animation.DoubleAnimation
-        $rise.From = $startY
-        $rise.To = 0.0
-        $rise.Duration = [Windows.Duration]::new([timespan]::FromMilliseconds($durationMs))
-        $rise.EasingFunction = $riseEase
-        $rise.FillBehavior = [Windows.Media.Animation.FillBehavior]::Stop
-
-        $fade = New-Object Windows.Media.Animation.DoubleAnimation
-        $fade.From = 0.0
-        $fade.To = 1.0
-        $fade.Duration = [Windows.Duration]::new([timespan]::FromMilliseconds($fadeDurationMs))
-        $fade.EasingFunction = $fadeEase
-        $fade.FillBehavior = [Windows.Media.Animation.FillBehavior]::Stop
-
-        $offset.BeginAnimation(
-            [Windows.Media.TranslateTransform]::YProperty, $rise,
-            [Windows.Media.Animation.HandoffBehavior]::SnapshotAndReplace)
-        $page.BeginAnimation(
-            [Windows.UIElement]::OpacityProperty, $fade,
-            [Windows.Media.Animation.HandoffBehavior]::SnapshotAndReplace)
+        Stop-ScriptXHomeEntrance
+        $script:HomeEntranceActive = $true
+        $variant = if ($Initial) { 'Initial' } else { 'Return' }
+        $clocks = $script:HomeEntranceClocks[$variant]
+        for ($i = 0; $i -lt $script:HomeEntranceGroups.Count; $i++) {
+            $groupName = $script:HomeEntranceGroups[$i]
+            $move = $script:HomeEntranceOffsets[$groupName]
+            $move.BeginAnimation(
+                [Windows.Media.TranslateTransform]::YProperty, $clocks.Shifts[$i],
+                [Windows.Media.Animation.HandoffBehavior]::SnapshotAndReplace)
+            $ui[$groupName].BeginAnimation(
+                [Windows.UIElement]::OpacityProperty, $clocks.Fades[$i],
+                [Windows.Media.Animation.HandoffBehavior]::SnapshotAndReplace)
+        }
     }
     catch {
-        # A decorative page transition must never blank the dashboard.
-        $script:PageContentOffset.Y = 0.0
-        $script:PageContentSurface.Opacity = 1.0
+        Stop-ScriptXHomeEntrance
+        Start-ScriptXHomeVisualServices
+        Write-HsStartupLog ('HOME_ENTRANCE_FALLBACK: ' + $_.Exception.Message)
     }
 }
 
-# All sidebar destinations work. Non-Home categories deliberately have
-# empty content for now; they do not call placeholder dialogs or run tweaks.
-$script:NavSelectedBg = $window.FindResource('NavSelectedGlass')
-$script:NavSelectedFg = [Windows.Media.BrushConverter]::new().ConvertFromString('#F7FAFF')
-$script:NavIdleFg = [Windows.Media.BrushConverter]::new().ConvertFromString('#B6C7D9')
+# Scale the clipping rectangle from its left edge; the frame keeps its full dimensions.
+$script:NavRevealScale = [Windows.Media.ScaleTransform]::new(1.0, 1.0)
+$script:NavRevealClip = [Windows.Media.RectangleGeometry]::new()
+$script:NavRevealClip.Transform = $script:NavRevealScale
+$ui.NavSelectionFrame.Clip = $script:NavRevealClip
+$script:NavSelectionReveal = $window.FindResource('NavSelectionReveal')
+$script:NavMarkerFade = $window.FindResource('NavMarkerFade').Clone()
+$script:NavMarkerFade.BeginTime = $script:NavSelectionReveal.Duration.TimeSpan
+$script:NavMarkerFade.Freeze()
+
+function Show-SidebarSelection([switch]$Immediate) {
+    if (-not $script:SelectedScriptXPage) { return }
+    $button = $ui[$script:SelectedScriptXPage]
+    if ($button.ActualWidth -le 0 -or $button.ActualHeight -le 0) { return }
+
+    $frame = $ui.NavSelectionFrame
+    $pos = $button.TranslatePoint([Windows.Point]::new(0, 0), $ui.NavSelectionLayer)
+    [Windows.Controls.Canvas]::SetLeft($frame, $pos.X)
+    [Windows.Controls.Canvas]::SetTop($frame, $pos.Y)
+    $frame.Width = $button.ActualWidth
+    $frame.Height = $button.ActualHeight
+
+    $script:NavRevealClip.Rect = [Windows.Rect]::new(0, 0, $frame.Width, $frame.Height)
+    $marker = $ui.NavSelectionMarker
+    $opacity = [Windows.UIElement]::OpacityProperty
+    # Release the previous row's fade before the shared marker moves into view.
+    $marker.BeginAnimation($opacity, $null)
+    $marker.Opacity = 0.0
+    $motion = $null
+    if (-not $Immediate -and [Windows.SystemParameters]::ClientAreaAnimation) {
+        $motion = $script:NavSelectionReveal
+    }
+    $script:NavRevealScale.BeginAnimation([Windows.Media.ScaleTransform]::ScaleXProperty, $motion)
+    if ($null -ne $motion) {
+        $marker.BeginAnimation($opacity, $script:NavMarkerFade)
+    } else {
+        $marker.Opacity = 1.0
+    }
+    $frame.Opacity = 1
+}
+
+$ui.NavSelectionLayer.Add_Loaded({ Show-SidebarSelection -Immediate })
+$ui.NavSelectionLayer.Add_SizeChanged({ Show-SidebarSelection -Immediate })
+
 function Set-ScriptXPage {
     param([ValidateSet('Home','Boost','Latency','Network','Cleanup')][string]$Name)
 
     if ($Name -eq $script:SelectedScriptXPage) { return }
     $script:SelectedScriptXPage = $Name
+    Show-SidebarSelection
     $homeSelected = $Name -eq 'Home'
+    # Do not reset the initial XAML opacity before the first painted frame.
+    # Once running, detach any stale HOME clocks on rapid navigation.
+    if ($script:UiInitialized) { Stop-ScriptXHomeEntrance }
+    # Hidden retains the measured/arranged HOME dashboard in memory, so the
+    # first return does not reconstruct its large card/ring layout.
     $ui.HomePage.Visibility = if ($homeSelected) {
         [Windows.Visibility]::Visible
     } else {
-        [Windows.Visibility]::Collapsed
+        [Windows.Visibility]::Hidden
     }
     $ui.BlankPage.Visibility = if ($homeSelected) {
         [Windows.Visibility]::Collapsed
     } else {
         [Windows.Visibility]::Visible
     }
+    # On an early navigation away from HOME, complete decorative warmup at
+    # idle on the blank page. A canceled fade cannot strand the card shadows.
+    if (-not $homeSelected -and $script:UiInitialized) {
+        Start-ScriptXHomeVisualServices
+        Resume-ScriptXCardShadowBatch
+    }
+    # Start the HOME-only entrance as soon as HOME is shown. The page is
+    # already kept in the visual tree; no layout rebuild and no main-area veil.
+    if ($homeSelected -and $script:UiInitialized) {
+        Start-ScriptXHomeEntrance
+    }
     if ($null -ne $script:FpsFramePresenter) {
         $script:FpsFramePresenter.SetVisible([bool]($homeSelected -and
             $script:UiInitialized -and
             $window.WindowState -eq [Windows.WindowState]::Normal))
     }
-    foreach ($navName in @('Home','Boost','Latency','Network','Cleanup')) {
-        $active = $navName -eq $Name
-        $ui[$navName].Background = if ($active) {
-            $script:NavSelectedBg
-        } else {
-            [Windows.Media.Brushes]::Transparent
-        }
-        $ui[$navName].Foreground = if ($active) {
-            $script:NavSelectedFg
-        } else {
-            $script:NavIdleFg
-        }
+    # Fallback gauge animation only draws when HOME is visible. Native FPS
+    # capture/sampling keeps running independently on all destinations.
+    if ($script:UiInitialized -and $fpsFallbackTimer) {
+        if ($homeSelected -and
+            $window.WindowState -eq [Windows.WindowState]::Normal) {
+            $script:LastFpsFallbackFrame = [datetime]::UtcNow
+            $fpsFallbackTimer.Start()
+        } else { $fpsFallbackTimer.Stop() }
     }
-    if ($homeSelected -and $script:UiInitialized) { Restore-HealthView }
-    # Preserve category/page-content transitions (not window zoom).
-    if ($script:UiInitialized) { Start-ScriptXPageEntrance }
+    if ($homeSelected -and $script:UiInitialized) {
+        Request-ScriptXHomeRefresh
+        # Resume painting genuine FPS samples; the independent capture engine
+        # never stopped on blank pages or while switching tabs.
+        $script:Fps430LastRender = [datetime]::MinValue
+    }
+    # Blank destinations do not animate the main content surface.
 }
 $ui.Home.Add_Click({ Set-ScriptXPage -Name 'Home' })
 foreach ($navName in @('Boost','Latency','Network','Cleanup')) {
@@ -6089,10 +6435,18 @@ $timer.Interval = [timespan]::FromMilliseconds(250)
 
 $timer.Add_Tick({
     # No top-level window entrance/exit animation or motion pause.
-    $ui.Clock.Text = Get-Date -Format 'HH:mm:ss'
+    # Avoid a WPF text/layout invalidation four times per second when the
+    # clock only has one-second resolution, and skip hidden dashboard work.
+    if ($ui.HomePage.IsVisible -and
+        $window.WindowState -ne [Windows.WindowState]::Minimized) {
+        $clockText = Get-Date -Format 'HH:mm:ss'
+        if ($ui.Clock.Text -cne $clockText) { $ui.Clock.Text = $clockText }
+    }
     # Capture snapshots refresh at the background engine's ~250ms cadence.
     # The ring's WPF timeline renders intermediate visual positions independently.
-    if (([datetime]::UtcNow - $script:Fps430LastRender).TotalMilliseconds -ge 240) {
+    if ($ui.HomePage.IsVisible -and
+        $window.WindowState -ne [Windows.WindowState]::Minimized -and
+        ([datetime]::UtcNow - $script:Fps430LastRender).TotalMilliseconds -ge 240) {
         $script:Fps430LastRender = [datetime]::UtcNow
         Update-RealGameFps
         if (($FpsDiagnostics -or $FpsProbe) -and $null -ne $script:FpsFramePresenter) {
@@ -6121,7 +6475,8 @@ $timer.Add_Tick({
             $healthResult=$r[-1].HealthV2
             if ($null -ne $healthResult) {
                 $script:LastHealthResult=$healthResult
-                if ($ui.HomePage.IsVisible -and $window.WindowState -ne [Windows.WindowState]::Minimized) {
+                if (-not $script:HomeEntranceActive -and
+                    $ui.HomePage.IsVisible -and $window.WindowState -ne [Windows.WindowState]::Minimized) {
                     Update-SystemHealth $healthResult
                 }
             }
@@ -6129,10 +6484,19 @@ $timer.Add_Tick({
                 throw 'A telemetry provider failed'
             }
 
-            Show-Reading $r[-1]
+            # Keep true measured results cached across page changes, but do
+            # not trigger invisible HOME card layout on blank pages.
+            if (-not $script:HomeEntranceActive -and
+                $ui.HomePage.IsVisible -and
+                $window.WindowState -ne [Windows.WindowState]::Minimized) {
+                Show-Reading $r[-1]
+            } else {
+                $state.Latest = $r[-1]
+                $state.LastGood = Get-Date
+            }
         }
         catch {
-            $ui.Connection.Text = '● DATA UNAVAILABLE / RETRYING'
+            $ui.Connection.Text = ($script:DisplayBullet + ' DATA UNAVAILABLE / RETRYING')
             Show-NetworkReading $null
             Update-HealthAvailability
         }
@@ -6142,6 +6506,8 @@ $timer.Add_Tick({
     }
 
     if (
+        $ui.HomePage.IsVisible -and
+        $window.WindowState -ne [Windows.WindowState]::Minimized -and
         $null -eq $state.Pending -and
         ((Get-Date) - $state.Started).TotalMilliseconds -ge $script:Config.RefreshMs
     ) {
@@ -6149,11 +6515,13 @@ $timer.Add_Tick({
     }
 
     if (
+        $ui.HomePage.IsVisible -and
+        $window.WindowState -ne [Windows.WindowState]::Minimized -and
         $state.LastGood -gt [datetime]::MinValue -and
         ((Get-Date) - $state.LastGood).TotalMilliseconds -gt
             [math]::Max(10000, 4 * $script:Config.RefreshMs)
     ) {
-        $ui.Connection.Text = '● STALE DATA / WAITING FOR PROVIDERS'
+        $ui.Connection.Text = ($script:DisplayBullet + ' STALE DATA / WAITING FOR PROVIDERS')
         Show-NetworkReading $null
         Update-HealthAvailability
     }
@@ -6208,38 +6576,32 @@ function Initialize-MeterGlow {
 
 $window.Add_ContentRendered({
     if ($script:UiInitialized) { return }
-    Initialize-CardShadows
-
-    # OS owns the real HWND's first appearance. Initialize genuine telemetry
-    # once after the first content paint.
+    # ContentRendered must return quickly so the first user input is not
+    # blocked by card-shadow graph traversal or native FPS startup.
     $script:UiInitialized = $true
-    try {
-        Start-Reading
-        Start-Fps433Engine
-        Update-RealGameFps
-        Update-FpsRingProgress
-        if (-not $script:MeterGlowInitialized) {
-            Initialize-MeterGlow
-            $script:MeterGlowInitialized = $true
-        }
+    # The initial HOME reveal is HOME-only; it cannot flash blank pages.
+    Start-ScriptXHomeEntrance -Initial
+    try { Start-Reading }
+    catch { Write-HsStartupLog ('TELEMETRY_INIT_FAILED: ' + $_.Exception.Message) }
+    $script:LastFpsFallbackFrame = [datetime]::UtcNow
+    $timer.Start()
+    if ($fpsFallbackTimer -and $window.WindowState -eq [Windows.WindowState]::Normal) {
+        $fpsFallbackTimer.Start()
     }
-    catch {
-        Write-HsStartupLog ('STARTUP_RUNTIME_INIT_FAILED: ' + ($_ | Out-String))
+    if ($null -ne $script:FpsFramePresenter) {
+        $script:FpsFramePresenter.SetVisible([bool](
+            $ui.HomePage.Visibility -eq [Windows.Visibility]::Visible -and
+            $window.WindowState -eq [Windows.WindowState]::Normal))
     }
-    finally {
-        # Dashboard timers are not used to move or animate the HWND.
-        $script:LastFpsFallbackFrame = [datetime]::UtcNow
-        $timer.Start()
-        if ($fpsFallbackTimer -and $window.WindowState -eq [Windows.WindowState]::Normal) {
-            $fpsFallbackTimer.Start()
-        }
-        if ($null -ne $script:FpsFramePresenter) {
-            $script:FpsFramePresenter.SetVisible([bool](
-                $ui.HomePage.Visibility -eq [Windows.Visibility]::Visible -and
-                $window.WindowState -eq [Windows.WindowState]::Normal))
-        }
-    }
+    # Shadow/Glow initialization is triggered by completion of HOME's last
+    # card fade, not queued ahead of WPF's first fully visible HOME frame.
 })
+
+# FPS engine starts its own sampler/capture background threads. Move this
+# lightweight Start call before the first window render so first-run JIT/thread
+# creation cannot interrupt the entrance effect. No capture cadence changed.
+try { Start-Fps433Engine }
+catch { Write-HsStartupLog ('FPS_STARTUP_FAILED: ' + $_.Exception.Message) }
 
 try {
     [void]$window.ShowDialog()
